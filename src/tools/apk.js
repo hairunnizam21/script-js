@@ -194,6 +194,27 @@ function keystoreOf(ctx, args) {
   };
 }
 
+// Locate bundletool: a `bundletool` wrapper on PATH, or a jar run via java
+// (env BUNDLETOOL_JAR or common install dirs). Returns the argv prefix or null.
+function bundletoolInvoker() {
+  const wrapper = which("bundletool");
+  if (wrapper) return [wrapper];
+  if (!which("java")) return null;
+  const jars = [
+    process.env.BUNDLETOOL_JAR,
+    "/opt/bundletool/bundletool.jar",
+    process.env.PREFIX ? `${process.env.PREFIX}/opt/bundletool/bundletool.jar` : null,
+  ].filter(Boolean);
+  for (const jar of jars) {
+    try {
+      if (fs.existsSync(jar)) return ["java", "-jar", jar];
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
 export function register(reg) {
   // ---------------------------------------------------------------- detect
   reg.register({
@@ -496,6 +517,103 @@ export function register(reg) {
           verification.ok === false
             ? "WARNING: apksigner could not verify the signature — investigate before delivering."
             : "Final signed + aligned APK ready and signature-verified. Call deliver to send it.",
+      };
+    },
+  });
+
+  // ----------------------------------------------------- aab → universal apk
+  reg.register({
+    name: "aab_to_apk",
+    description:
+      "Convert an Android App Bundle (.aab) into a single UNIVERSAL, installable APK using bundletool, " +
+      "signed with the debug keystore. The universal APK contains all ABIs/densities/languages so it installs " +
+      "directly on any device (fixes the common 'AAB can't be installed' / 'not compatible' problem). " +
+      "Returns the signed universal APK path — good to deliver.",
+    parameters: {
+      type: "object",
+      properties: {
+        aab: { type: "string", description: "Path to the .aab file." },
+        out_apk: { type: "string", description: "Optional output APK path." },
+        keystore: { type: "string" },
+        storepass: { type: "string" },
+        keypass: { type: "string" },
+        alias: { type: "string" },
+      },
+      required: ["aab"],
+    },
+    handler: async (args, ctx) => {
+      const aab = resolve(args.aab, ctx.workspace);
+      if (!fs.existsSync(aab)) return { error: `aab not found: ${aab}` };
+      const bt = bundletoolInvoker();
+      if (!bt)
+        return { error: "bundletool not installed — run install.sh (needs java + bundletool)" };
+      const ks = keystoreOf(ctx, args);
+      // Phase 1: build the universal APK set (.apks) — 5–70%.
+      report(ctx, { percent: 5, label: "Membina APK universal (bundletool)", ceil: 70 });
+      const apks = `${stem(aab)}.apks`;
+      try {
+        fs.rmSync(apks, { force: true });
+      } catch {
+        /* ignore */
+      }
+      const buildArgv = [
+        ...bt,
+        "build-apks",
+        `--bundle=${aab}`,
+        `--output=${apks}`,
+        "--mode=universal",
+        "--overwrite",
+      ];
+      if (ks.keystore && fs.existsSync(ks.keystore)) {
+        buildArgv.push(
+          `--ks=${ks.keystore}`,
+          `--ks-pass=pass:${ks.storepass}`,
+          `--ks-key-alias=${ks.alias}`,
+          `--key-pass=pass:${ks.keypass}`,
+        );
+      }
+      const build = await run(buildArgv, { timeout: 900000 });
+      if (build.exit_code !== 0 || !fs.existsSync(apks))
+        return {
+          stage: "build-apks",
+          ...build,
+          error: build.error || "bundletool build-apks failed",
+        };
+      // Phase 2: extract universal.apk from the .apks archive — 70–90%.
+      report(ctx, { percent: 70, label: "Mengekstrak universal.apk", ceil: 90 });
+      const tmp = `${apks}.extract`;
+      try {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+      const ex = await run(["unzip", "-o", apks, "universal.apk", "-d", tmp], { timeout: 120000 });
+      const universal = path.join(tmp, "universal.apk");
+      if (!fs.existsSync(universal))
+        return { stage: "extract", ...ex, error: "universal.apk not found inside the .apks archive" };
+      const out = resolve(args.out_apk || `${stem(aab)}.universal.apk`, ctx.workspace);
+      fs.copyFileSync(universal, out);
+      try {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+      // Phase 3: self-verify signature + report compatibility — 90–100%.
+      report(ctx, { percent: 92, label: "Mengesahkan APK" });
+      const verification = await verifyApkSignature(out);
+      const abis = await apkAbis(out);
+      const compatibility = abis == null ? null : summarizeAbiCompatibility(abis);
+      report(ctx, { percent: 100, label: "APK siap" });
+      return {
+        ok: true,
+        out_apk: out,
+        verified: verification.ok,
+        verification,
+        compatibility,
+        note:
+          verification.ok === false
+            ? "WARNING: apksigner could not verify the universal APK — investigate before delivering."
+            : "Universal APK built from the AAB, signed and verified. Installs on all devices. Call deliver to send it.",
       };
     },
   });
