@@ -20,7 +20,16 @@ import { runTurn } from "./agent.js";
 import { renderSystemPrompt } from "./prompts.js";
 import { fetchModels, isVisionModel, FALLBACK_MODELS } from "./models.js";
 import { FileServer } from "./fileserver.js";
+import { ocrImage } from "./tools/util.js";
 import os from "node:os";
+
+// Instruction attached to uploaded images so the AI actually diagnoses the
+// problem in a screenshot (the common case: a user screenshots an error).
+const IMAGE_ANALYSIS_PROMPT =
+  "Pengguna menghantar gambar/screenshot (selalunya paparan RALAT/error). " +
+  "Baca SEMUA teks dalam gambar (mesej ralat, log, stack trace, kod, nama fail). " +
+  "Kenal pasti punca sebenar masalah, kemudian beri penyelesaian konkrit langkah demi langkah " +
+  "(termasuk arahan/command yang perlu dijalankan jika ada). Jika maklumat tidak cukup, tanya satu soalan ringkas.";
 
 const PHASE_LABELS = {
   shell: "Menjalankan arahan",
@@ -50,6 +59,7 @@ const PHASE_LABELS = {
   file_type: "Mengesan jenis fail",
   detect_project: "Mengesan jenis projek",
   build_project: "Build projek",
+  ocr_image: "Membaca teks dalam gambar (OCR)",
 };
 
 function phaseLabel(name) {
@@ -624,23 +634,63 @@ export class SuzuBot {
       return;
     }
 
-    // Image + vision model → forward as image content.
-    const meta = this.store.getMeta(userId);
-    const model = meta?.model || this.cfg.defaultModel;
-    if (this.cfg.enableVision && IMAGE_EXT.has(ext) && isVisionModel(model, this.models)) {
-      const b64 = fs.readFileSync(dest).toString("base64");
-      const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
-      const content = [
-        { type: "text", text: caption || "Tolong lihat gambar ini." },
-        { type: "image_url", image_url: { url: `data:${mime};base64,${b64}` } },
-      ];
-      await this.routeToAgent(chatId, userId, content, { fileNote: `Gambar disimpan di ${dest}` });
+    // Images (screenshots) → let the AI actually read & diagnose them.
+    if (IMAGE_EXT.has(ext)) {
+      await this.handleImageUpload(chatId, userId, dest, ext, caption);
       return;
     }
 
     // Other files → announce path so the agent can read/analyse.
     const note = `User memuat naik fail ke: ${dest}` + (caption ? `\nNota user: ${caption}` : "");
     await this.routeToAgent(chatId, userId, note, { replyTo: msg.message_id });
+  }
+
+  // Handle an uploaded image. Two complementary paths so the AI can ALWAYS
+  // "read" the picture and solve the problem in it:
+  //   1. Vision model → send the image itself (plus OCR'd text as a hint).
+  //   2. Non-vision model (or vision disabled) → OCR the image to text and feed
+  //      that to the model, so even text-only models can diagnose a screenshot.
+  async handleImageUpload(chatId, userId, dest, ext, caption) {
+    const meta = this.store.getMeta(userId);
+    const model = meta?.model || this.cfg.defaultModel;
+    const useVision =
+      this.cfg.enableVision && isVisionModel(model, this.models);
+
+    // Best-effort OCR — gives exact error text (and is the only signal for
+    // non-vision models). Never fatal if tesseract is missing.
+    let ocrText = "";
+    try {
+      const r = await ocrImage(dest);
+      if (r.ok && r.text) ocrText = r.text.slice(0, 6000);
+    } catch {
+      /* ignore OCR failures */
+    }
+
+    const userNote = caption ? `\nNota pengguna: ${caption}` : "";
+    const ocrBlock = ocrText
+      ? `\n\nTeks yang dikesan dari gambar (OCR):\n"""\n${ocrText}\n"""`
+      : "";
+
+    if (useVision) {
+      const b64 = fs.readFileSync(dest).toString("base64");
+      const mime =
+        ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+      const content = [
+        { type: "text", text: `${IMAGE_ANALYSIS_PROMPT}${userNote}${ocrBlock}\n\nGambar disimpan di: ${dest}` },
+        { type: "image_url", image_url: { url: `data:${mime};base64,${b64}` } },
+      ];
+      await this.routeToAgent(chatId, userId, content);
+      return;
+    }
+
+    // Text-only model: rely on OCR. If OCR found nothing, tell the agent it can
+    // run the ocr_image tool itself (and that the model may not support vision).
+    const text = ocrText
+      ? `${IMAGE_ANALYSIS_PROMPT}${userNote}${ocrBlock}\n\nGambar disimpan di: ${dest}`
+      : `Pengguna menghantar gambar/screenshot di: ${dest}.${userNote}\n` +
+        `Model semasa mungkin tiada sokongan penglihatan (vision). Guna tool \`ocr_image\` untuk membaca teks ` +
+        `dalam gambar, kemudian ${IMAGE_ANALYSIS_PROMPT}`;
+    await this.routeToAgent(chatId, userId, text);
   }
 
   // -------------------------------------------------------- agent route
@@ -656,6 +706,8 @@ export class SuzuBot {
     session.model = meta.model || this.cfg.defaultModel;
     const workspace = this.store.workspace(userId);
 
+    const status = new StatusCard(this.tg, chatId);
+
     const ctx = {
       workspace,
       debug: this.cfg.debug,
@@ -664,9 +716,11 @@ export class SuzuBot {
       keystoreAlias: this.cfg.keystoreAlias,
       deliverables: [],
       deliverCaptions: {},
+      // Long-running tools (APK/project builds) report live % here so the chat
+      // status card shows a progress bar instead of a bare spinner.
+      onProgress: (p) => status.setProgress(p || {}),
     };
 
-    const status = new StatusCard(this.tg, chatId);
     await status.begin("🧠 Berfikir…");
     const typing = new TypingPinger(this.tg, chatId);
     typing.start();
@@ -1078,6 +1132,15 @@ export class SuzuBot {
 
 // Animated status "card": one message we keep editing with a spinner + phase.
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BAR_WIDTH = 12;
+
+// Render a textual progress bar like `▰▰▰▰▱▱▱▱▱▱▱▱ 33%`.
+function progressBar(percent) {
+  const p = Math.max(0, Math.min(100, Math.round(percent)));
+  const filled = Math.round((p / 100) * BAR_WIDTH);
+  return "▰".repeat(filled) + "▱".repeat(BAR_WIDTH - filled) + ` ${p}%`;
+}
+
 class StatusCard {
   constructor(tg, chatId) {
     this.tg = tg;
@@ -1087,6 +1150,11 @@ class StatusCard {
     this.frame = 0;
     this.timer = null;
     this.lastEdit = 0;
+    // Progress state. When percent is null we show the spinner; otherwise we
+    // show a % bar. `creepTo` lets the bar drift forward between real updates
+    // so long stages still feel alive.
+    this.percent = null;
+    this.creepTo = null;
   }
   async begin(initial) {
     this.phase = initial;
@@ -1098,13 +1166,36 @@ class StatusCard {
     }
     this.timer = setInterval(() => this.tick(), 1300);
   }
+  // Spinner mode (no known %). Used for thinking / generic tools.
   setPhase(text) {
     this.phase = text;
+    this.percent = null;
+    this.creepTo = null;
+  }
+  // Progress mode. percent = current known %, label = phase text, ceil = a soft
+  // ceiling the bar may slowly creep toward until the next real update.
+  setProgress({ percent, label, ceil } = {}) {
+    if (typeof label === "string" && label) this.phase = label;
+    if (Number.isFinite(percent)) {
+      this.percent = this.percent == null ? percent : Math.max(this.percent, percent);
+    } else if (this.percent == null) {
+      this.percent = 0;
+    }
+    this.creepTo = Number.isFinite(ceil) ? Math.max(ceil, this.percent) : null;
+  }
+  render() {
+    if (this.percent == null) return `${SPIN[this.frame]} ${this.phase}`;
+    return `${SPIN[this.frame]} ${this.phase}\n${progressBar(this.percent)}`;
   }
   async tick() {
     if (!this.messageId) return;
     this.frame = (this.frame + 1) % SPIN.length;
-    await this.tg.editMessageText(this.chatId, this.messageId, `${SPIN[this.frame]} ${this.phase}`);
+    // Ease the displayed % toward the soft ceiling between real updates.
+    if (this.percent != null && this.creepTo != null && this.percent < this.creepTo) {
+      const step = Math.max(1, (this.creepTo - this.percent) * 0.18);
+      this.percent = Math.min(this.creepTo, this.percent + step);
+    }
+    await this.tg.editMessageText(this.chatId, this.messageId, this.render());
   }
   async finish() {
     if (this.timer) clearInterval(this.timer);

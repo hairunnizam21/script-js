@@ -80,6 +80,9 @@ install_termux() {
   # zipalign / apksigner ship in the android-tools package on Termux.
   pkg install -y apksigner 2>/dev/null || true
   pkg install -y zipalign 2>/dev/null || true
+
+  # tesseract = OCR so the AI can read text/errors inside screenshots.
+  pkg install -y tesseract 2>/dev/null || true
 }
 
 install_debian() {
@@ -89,7 +92,7 @@ install_debian() {
   $SUDO apt-get install -y \
     ca-certificates curl gnupg git unzip zip file binutils \
     openjdk-17-jre-headless apktool aapt zipalign apksigner \
-    openssh-server python3 || true
+    openssh-server python3 tesseract-ocr || true
 
   # Node.js: prefer an existing >=18; otherwise install NodeSource 20.x.
   if ! have_node18; then
