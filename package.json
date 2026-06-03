@@ -9,7 +9,7 @@
   "main": "src/bot.js",
   "scripts": {
     "start": "node bin/suzu run",
-    "check": "node --check bin/suzu && node --check src/bot.js"
+    "check": "node scripts/check.mjs"
   },
   "engines": {
     "node": ">=18"

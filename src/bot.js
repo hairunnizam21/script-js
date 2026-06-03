@@ -20,7 +20,7 @@ import { runTurn } from "./agent.js";
 import { renderSystemPrompt } from "./prompts.js";
 import { fetchModels, isVisionModel, FALLBACK_MODELS } from "./models.js";
 import { FileServer } from "./fileserver.js";
-import { ocrImage } from "./tools/util.js";
+import { ocrImage, which } from "./tools/util.js";
 import os from "node:os";
 
 // Instruction attached to uploaded images so the AI actually diagnoses the
@@ -225,6 +225,13 @@ export class SuzuBot {
     // Best-effort: refresh live model list.
     this.models = await fetchModels(this.cfg);
     log(`${this.models.length} models available. Default: ${this.cfg.defaultModel}`);
+    // Capability banner so it's obvious from the logs whether the latest
+    // screenshot-reading code is running (helps diagnose stale deployments).
+    const ocrReady = !!which("tesseract");
+    log(
+      `Image diagnosis: vision=${this.cfg.enableVision ? "on" : "off"}, ` +
+        `OCR(tesseract)=${ocrReady ? "ready" : "MISSING — run install.sh"}`,
+    );
     if (this.fileServer) {
       this.fileServer.start();
       log(`Download server on port ${this.cfg.httpPort} (link host: ${this.linkHost()})`);
