@@ -6,14 +6,52 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { resolvePath, runCommand, which } from "./util.js";
+import {
+  resolvePath,
+  runCommand,
+  which,
+  parseBuildProgress,
+  spanPercent,
+  summarizeAbiCompatibility,
+  COMMON_ABIS,
+} from "./util.js";
 
 function resolve(p, ws) {
   return resolvePath(p, ws);
 }
 
-async function run(argv, { cwd, timeout = 900000 } = {}) {
-  return runCommand({ argv, cwd, timeout, maxChars: 15000 });
+async function run(argv, { cwd, timeout = 900000, onData } = {}) {
+  return runCommand({ argv, cwd, timeout, maxChars: 15000, onData });
+}
+
+// Report build progress to the chat status card if the bot wired up a callback.
+function report(ctx, payload) {
+  try {
+    ctx?.onProgress?.(payload);
+  } catch {
+    /* progress reporting must never break a build */
+  }
+}
+
+// Build an onData handler that maps a build tool's live output into a % within
+// the [floor, ceil] window of the current phase.
+function progressParser(ctx, tool, floor, ceil, label) {
+  return (chunk) => {
+    const prog = parseBuildProgress(chunk, tool);
+    if (prog) report(ctx, { percent: spanPercent(prog.fraction, floor, ceil), label, ceil });
+  };
+}
+
+// List the native ABIs (lib/<abi>/) present in an APK/zip.
+async function apkAbis(apkPath) {
+  const names = await listZip(apkPath);
+  if (!names) return null;
+  const abis = new Set();
+  for (const n of names) {
+    const m = n.match(/^lib\/([^/]+)\//);
+    if (m) abis.add(m[1]);
+  }
+  return [...abis].sort();
 }
 
 function stem(p) {
@@ -115,6 +153,8 @@ export function register(reg) {
         m = out.match(/targetSdkVersion:'([^']+)'/);
         if (m) findings.target_sdk = m[1];
       }
+      // Device compatibility based on the native ABIs present.
+      findings.compatibility = summarizeAbiCompatibility(findings.abis);
       return findings;
     },
   });
@@ -171,7 +211,9 @@ export function register(reg) {
       if (!which("apktool")) return { error: "apktool not installed — run install.sh" };
       const argv = ["apktool", "b", sp, "-o", outApk];
       if (args.use_aapt2 !== false) argv.push("--use-aapt2");
-      const r = await run(argv);
+      report(ctx, { percent: 5, label: "Recompile APK", ceil: 95 });
+      const r = await run(argv, { onData: progressParser(ctx, "apktool", 5, 95, "Recompile APK") });
+      report(ctx, { percent: 100, label: "Recompile siap" });
       r.out_apk = outApk;
       return r;
     },
@@ -284,19 +326,23 @@ export function register(reg) {
       const sp = resolve(args.src_dir, ctx.workspace);
       if (!fs.existsSync(sp)) return { error: `src_dir not found: ${sp}` };
       if (!which("apktool")) return { error: "apktool not installed — run install.sh" };
+      // Phase 1: recompile (0–60%).
+      report(ctx, { percent: 3, label: "Recompile APK", ceil: 60 });
       const unsigned = `${sp}.unsigned.apk`;
       const bargv = ["apktool", "b", sp, "-o", unsigned, "--use-aapt2"];
-      const build = await run(bargv);
+      const build = await run(bargv, { onData: progressParser(ctx, "apktool", 3, 58, "Recompile APK") });
       if (build.exit_code !== 0)
         return { stage: "recompile", ...build, error: build.error || "apktool build failed" };
-      // zipalign
+      // Phase 2: zipalign (60–75%).
+      report(ctx, { percent: 60, label: "Zipalign APK", ceil: 75 });
       let aligned = unsigned;
       if (which("zipalign")) {
         aligned = `${sp}.aligned.apk`;
         const za = await run(["zipalign", "-p", "-f", "4", unsigned, aligned], { timeout: 300000 });
         if (za.exit_code !== 0) return { stage: "zipalign", ...za };
       }
-      // sign
+      report(ctx, { percent: 75, label: "Menandatangani APK", ceil: 95 });
+      // Phase 3: sign (75–100%).
       const out = resolve(args.out_apk || `${stem(sp)}.signed.apk`, ctx.workspace);
       const ks = keystoreOf(ctx, args);
       if (!ks.keystore || !fs.existsSync(ks.keystore))
@@ -315,7 +361,17 @@ export function register(reg) {
         { timeout: 300000 },
       );
       if (sign.exit_code !== 0) return { stage: "sign", ...sign };
-      return { ok: true, out_apk: out, note: "Final signed + aligned APK ready. Call deliver to send it." };
+      report(ctx, { percent: 100, label: "APK siap" });
+      // Report device compatibility of the finished APK so the agent can tell
+      // the user which devices it installs on.
+      const abis = await apkAbis(out);
+      const compatibility = abis == null ? null : summarizeAbiCompatibility(abis);
+      return {
+        ok: true,
+        out_apk: out,
+        compatibility,
+        note: "Final signed + aligned APK ready. Call deliver to send it.",
+      };
     },
   });
 
@@ -440,12 +496,26 @@ export function register(reg) {
   reg.register({
     name: "build_project",
     description:
-      "Build an Android APK from a source project (auto-detects Gradle/Flutter/React Native/apktool). Runs the appropriate build command and reports the produced APK(s).",
+      "Build an Android APK from a source project (auto-detects Gradle/Flutter/React Native/apktool). " +
+      "By default builds a UNIVERSAL APK that bundles every common ABI (armeabi-v7a, arm64-v8a, x86, x86_64) " +
+      "so the result installs on ARM 32/64-bit and x86 devices alike. Reports the produced APK(s) and their device compatibility. " +
+      "Set universal=false (or pass abis) only when the user explicitly wants smaller, per-ABI splits.",
     parameters: {
       type: "object",
       properties: {
         dir: { type: "string" },
         variant: { type: "string", description: "release | debug (default release)" },
+        universal: {
+          type: "boolean",
+          description:
+            "Build one fat APK with all common ABIs so it installs everywhere (default true).",
+        },
+        abis: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Explicit ABI list (e.g. armeabi-v7a,arm64-v8a,x86,x86_64). Defaults to all common ABIs.",
+        },
       },
       required: ["dir"],
     },
@@ -453,20 +523,49 @@ export function register(reg) {
       const d = resolve(args.dir, ctx.workspace);
       if (!fs.existsSync(d)) return { error: `dir not found: ${d}` };
       const variant = (args.variant || "release").toLowerCase();
+      const universal = args.universal !== false;
+      const abis =
+        Array.isArray(args.abis) && args.abis.length ? args.abis.map(String) : COMMON_ABIS.slice();
       const has = (rel) => fs.existsSync(path.join(d, rel));
+
       let cmd;
+      let tool = "auto";
       if (has("pubspec.yaml")) {
-        cmd = `flutter build apk --${variant}`;
-      } else if (has("android/gradlew")) {
-        cmd = `cd android && ./gradlew assemble${cap(variant)}`;
+        tool = "gradle"; // flutter drives gradle under the hood
+        // `flutter build apk` (no --split-per-abi) already yields a universal
+        // fat APK. Pin the target platforms so all common ABIs are included.
+        const platforms = abis.map(flutterPlatform).filter(Boolean);
+        const targetFlag =
+          universal && platforms.length ? ` --target-platform ${[...new Set(platforms)].join(",")}` : "";
+        cmd = `flutter build apk --${variant}${targetFlag}`;
+      } else if (has("android/gradlew") || (has("package.json") && has("android"))) {
+        // React Native: the Android project lives in ./android. RN respects the
+        // `reactNativeArchitectures` gradle property — set it so the APK is
+        // universal across ABIs.
+        tool = "gradle";
+        const archProp = universal ? ` -PreactNativeArchitectures=${abis.join(",")}` : "";
+        cmd = `cd android && ./gradlew assemble${cap(variant)}${archProp}`;
       } else if (has("gradlew")) {
-        cmd = `./gradlew assemble${cap(variant)}`;
+        tool = "gradle";
+        const archProp = universal ? ` -PreactNativeArchitectures=${abis.join(",")}` : "";
+        cmd = `./gradlew assemble${cap(variant)}${archProp}`;
       } else if (has("apktool.yml")) {
+        tool = "apktool";
         cmd = `apktool b . -o build/out.unsigned.apk --use-aapt2`;
       } else {
         return { error: "could not detect a buildable project (no pubspec/gradlew/apktool.yml)" };
       }
-      const r = await runCommand({ command: cmd, cwd: d, timeout: 1800000, maxChars: 15000 });
+
+      report(ctx, { percent: 3, label: "Build projek", ceil: 95 });
+      const r = await runCommand({
+        command: cmd,
+        cwd: d,
+        timeout: 1800000,
+        maxChars: 15000,
+        onData: progressParser(ctx, tool, 3, 95, "Build projek"),
+      });
+      report(ctx, { percent: 100, label: "Build siap" });
+
       // Find produced APKs.
       const apks = [];
       const stack = [d];
@@ -486,9 +585,47 @@ export function register(reg) {
       }
       r.apks = apks.slice(0, 20);
       r.build_command = cmd;
+      r.universal_requested = universal;
+
+      // Report compatibility per produced APK and highlight the best (most
+      // universal) one to deliver.
+      const compat = {};
+      let best = null;
+      let bestScore = -1;
+      for (const a of r.apks) {
+        const list = await apkAbis(a);
+        const summary = list == null ? null : summarizeAbiCompatibility(list);
+        compat[a] = summary;
+        // Score: prefer no-native or both-ARM (universal), then ABI count.
+        const score = summary
+          ? (summary.universal ? 100 : 0) + summary.abis.length
+          : 0;
+        if (score > bestScore) {
+          bestScore = score;
+          best = a;
+        }
+      }
+      r.compatibility = compat;
+      r.recommended_apk = best;
       return r;
     },
   });
+}
+
+// Map an Android ABI to the `flutter build apk --target-platform` token.
+function flutterPlatform(abi) {
+  switch (abi) {
+    case "armeabi-v7a":
+      return "android-arm";
+    case "arm64-v8a":
+      return "android-arm64";
+    case "x86_64":
+      return "android-x64";
+    case "x86":
+      return null; // flutter dropped 32-bit x86 support; skip it.
+    default:
+      return null;
+  }
 }
 
 function cap(s) {

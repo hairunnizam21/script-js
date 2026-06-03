@@ -2,7 +2,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { resolvePath } from "./util.js";
+import { resolvePath, ocrImage, which } from "./util.js";
 
 function walk(root, onFile, max = 5000) {
   const stack = [root];
@@ -296,6 +296,38 @@ export function register(reg) {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.renameSync(src, dest);
       return { src, dest, moved: true };
+    },
+  });
+
+  reg.register({
+    name: "ocr_image",
+    description:
+      "Extract text from an image/screenshot using OCR (tesseract). Use this to READ error messages, logs, " +
+      "stack traces or any text the user screenshotted — especially when the current model has no vision support. " +
+      "Returns the recognised text so you can diagnose and fix the problem shown in the picture.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the image file." },
+        lang: {
+          type: "string",
+          description: "Optional tesseract language(s), e.g. 'eng' or 'eng+msa'. Default eng.",
+        },
+      },
+      required: ["path"],
+    },
+    handler: async (args, ctx) => {
+      const p = resolvePath(args.path, ctx.workspace);
+      if (!fs.existsSync(p)) return { error: `image not found: ${p}` };
+      if (!which("tesseract"))
+        return { error: "OCR engine (tesseract) not installed — run install.sh to enable it" };
+      const res = await ocrImage(p, { lang: args.lang });
+      if (!res.ok) return { error: res.error };
+      return {
+        path: p,
+        chars: res.text.length,
+        text: res.text || "(no text detected in the image)",
+      };
     },
   });
 
