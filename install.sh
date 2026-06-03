@@ -94,8 +94,17 @@ install_debian() {
   # Node.js: prefer an existing >=18; otherwise install NodeSource 20.x.
   if ! have_node18; then
     say "Memasang Node.js 20.x (NodeSource)…"
-    curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash - >/dev/null 2>&1 || true
-    $SUDO apt-get install -y nodejs || true
+    # Download then run the setup script. Piping straight into `$SUDO -E bash -`
+    # breaks when running as root (empty $SUDO leaves a stray `-E`), so use a
+    # temp file and run it with or without sudo explicitly.
+    local setup="/tmp/nodesource_setup_20.sh"
+    if curl -fsSL https://deb.nodesource.com/setup_20.x -o "$setup"; then
+      if [ -n "$SUDO" ]; then $SUDO -E bash "$setup"; else bash "$setup"; fi
+      $SUDO apt-get install -y nodejs || true
+      rm -f "$setup"
+    else
+      warn "Gagal memuat turun skrip NodeSource."
+    fi
   fi
 }
 
