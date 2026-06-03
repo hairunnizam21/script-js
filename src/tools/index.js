@@ -64,6 +64,55 @@ export function buildRegistry() {
   files.register(reg);
   apk.register(reg);
 
+  // update_plan — show the user a live checklist of what you're doing. Use it
+  // for any multi-step task so progress is visible (like Devin's task list).
+  reg.register({
+    name: "update_plan",
+    description:
+      "Show/refresh a short, visible step-by-step plan (checklist) for a multi-step task. " +
+      "Call it at the START with the steps, then again whenever a step's status changes. " +
+      "Keep it to 2–7 concise steps. Mark exactly one step 'in_progress' at a time and 'done' as you finish. " +
+      "This is for the user's visibility — it does not run anything.",
+    parameters: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          description: "Ordered list of plan steps.",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string", description: "Short step description." },
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "done"],
+                description: "Step status (default pending).",
+              },
+            },
+            required: ["title"],
+          },
+        },
+        note: { type: "string", description: "Optional one-line note shown under the plan." },
+      },
+      required: ["steps"],
+    },
+    handler: async (args, ctx) => {
+      if (!Array.isArray(args.steps) || !args.steps.length)
+        return { error: "`steps` (non-empty array) is required" };
+      const steps = args.steps.slice(0, 12).map((s) => ({
+        title: String(s?.title ?? "").slice(0, 160) || "(langkah)",
+        status: ["pending", "in_progress", "done"].includes(s?.status) ? s.status : "pending",
+      }));
+      try {
+        ctx?.onPlan?.(steps, args.note ? String(args.note).slice(0, 200) : "");
+      } catch {
+        /* plan rendering must never break the run */
+      }
+      const done = steps.filter((s) => s.status === "done").length;
+      return { ok: true, steps, progress: `${done}/${steps.length} done` };
+    },
+  });
+
   // deliver — the only way a file reaches the user over Telegram.
   reg.register({
     name: "deliver",

@@ -60,6 +60,8 @@ const PHASE_LABELS = {
   detect_project: "Mengesan jenis projek",
   build_project: "Build projek",
   ocr_image: "Membaca teks dalam gambar (OCR)",
+  verify_apk: "Mengesahkan APK",
+  update_plan: "Mengemas kini pelan",
 };
 
 function phaseLabel(name) {
@@ -707,6 +709,7 @@ export class SuzuBot {
     const workspace = this.store.workspace(userId);
 
     const status = new StatusCard(this.tg, chatId);
+    const plan = new PlanCard(this.tg, chatId);
 
     const ctx = {
       workspace,
@@ -719,6 +722,10 @@ export class SuzuBot {
       // Long-running tools (APK/project builds) report live % here so the chat
       // status card shows a progress bar instead of a bare spinner.
       onProgress: (p) => status.setProgress(p || {}),
+      // The update_plan tool reports the visible step-by-step checklist here.
+      onPlan: (steps, note) => {
+        plan.update(steps, note);
+      },
     };
 
     await status.begin("🧠 Berfikir…");
@@ -1205,6 +1212,43 @@ class StatusCard {
       } catch {
         await this.tg.editMessageText(this.chatId, this.messageId, "✅ Siap");
       }
+    }
+  }
+}
+
+// A separate chat message that shows the AI's step-by-step plan (a visible
+// checklist), updated as the model calls the update_plan tool. Lets the user
+// follow along like Devin's task list.
+const PLAN_ICON = { pending: "⬜️", in_progress: "🔄", done: "✅" };
+
+class PlanCard {
+  constructor(tg, chatId) {
+    this.tg = tg;
+    this.chatId = chatId;
+    this.messageId = null;
+    this.lastText = "";
+  }
+  render(steps, note) {
+    const lines = steps.map((s) => `${PLAN_ICON[s.status] || "⬜️"} ${s.title}`);
+    const done = steps.filter((s) => s.status === "done").length;
+    let out = `📋 Pelan (${done}/${steps.length})\n` + lines.join("\n");
+    if (note) out += `\n\n${note}`;
+    return out;
+  }
+  async update(steps, note) {
+    if (!Array.isArray(steps) || !steps.length) return;
+    const text = this.render(steps, note);
+    if (text === this.lastText) return;
+    this.lastText = text;
+    try {
+      if (!this.messageId) {
+        const m = await this.tg.sendMessage(this.chatId, text);
+        this.messageId = m?.message_id || null;
+      } else {
+        await this.tg.editMessageText(this.chatId, this.messageId, text);
+      }
+    } catch {
+      /* plan rendering must never break the run */
     }
   }
 }

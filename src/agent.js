@@ -44,6 +44,10 @@ export async function runTurn({
 
   const tools = registry.schemas();
   const finalParts = [];
+  // Auto-recovery bookkeeping: count how often each identical tool call fails so
+  // we can nudge the model toward a different approach instead of looping.
+  const callFails = new Map(); // signature -> consecutive failure count
+  const callSeen = new Map(); // signature -> total times attempted
 
   for (let iteration = 0; iteration < cfg.maxToolIters; iteration++) {
     emit("iteration", { index: iteration });
@@ -117,8 +121,39 @@ export async function runTurn({
       const name = tc.function?.name || "";
       const rawArgs = tc.function?.arguments || "{}";
       const callId = tc.id || `call_${Date.now()}`;
+      const sig = `${name}:${rawArgs}`;
+      const seen = (callSeen.get(sig) || 0) + 1;
+      callSeen.set(sig, seen);
+
       emit("tool_start", { name, arguments: rawArgs, call_id: callId });
-      const output = await registry.invoke(name, rawArgs, ctx);
+
+      // Loop breaker: if the model keeps issuing the exact same call, stop
+      // running it and tell it to change approach (prevents wasteful loops).
+      let output;
+      if (seen > 4) {
+        output = JSON.stringify({
+          error: `Loop guard: '${name}' was called with identical arguments ${seen} times. ` +
+            `Stop repeating it — change the arguments, try a different tool/approach, or if you are truly stuck, ` +
+            `explain the blocker to the user.`,
+          _loop_guard: true,
+        });
+      } else {
+        output = await registry.invoke(name, rawArgs, ctx);
+      }
+
+      // Detect failure and append a recovery hint so the model self-corrects.
+      const failed = outputIsError(output);
+      if (failed) {
+        const fails = (callFails.get(sig) || 0) + 1;
+        callFails.set(sig, fails);
+        if (fails >= 2) {
+          emit("recover", { name, attempts: fails });
+          output = withRecoveryHint(output, fails);
+        }
+      } else {
+        callFails.delete(sig);
+      }
+
       emit("tool_end", { name, call_id: callId, output });
       session.messages.push({
         role: "tool",
@@ -133,6 +168,40 @@ export async function runTurn({
   const text = finalParts.join("") || "(reached the tool-iteration limit)";
   emit("done", { text });
   return text;
+}
+
+// Does a tool's JSON output represent a failure? We only treat an explicit
+// `error` field as a failure (a non-zero exit_code can be legitimate, e.g. grep
+// with no matches), to avoid false positives.
+function outputIsError(output) {
+  if (typeof output !== "string") return false;
+  try {
+    const obj = JSON.parse(output);
+    return !!(obj && typeof obj === "object" && obj.error);
+  } catch {
+    return false;
+  }
+}
+
+// Append a recovery hint to a failed tool result so the model changes tack
+// instead of repeating the same failing call.
+function withRecoveryHint(output, attempts) {
+  const hint =
+    attempts >= 3
+      ? "This approach has failed multiple times. Try a clearly DIFFERENT strategy " +
+        "(different tool, inspect the inputs first, or fix the root cause). If genuinely blocked, tell the user what's wrong."
+      : "That call failed. Read the error, then adjust your arguments or try a different approach — do not repeat the same call.";
+  try {
+    const obj = JSON.parse(output);
+    if (obj && typeof obj === "object") {
+      obj._recovery_hint = hint;
+      obj._attempts = attempts;
+      return JSON.stringify(obj);
+    }
+  } catch {
+    /* fall through */
+  }
+  return `${output}\n_recovery_hint: ${hint}`;
 }
 
 // Very conservative parser for models that print tool calls as text.
