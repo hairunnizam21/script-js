@@ -24,22 +24,112 @@ server**.
 
 ---
 
-## 🚀 Cara Install (satu perintah)
+## 🚀 Cara Install
 
-### Termux (Android) atau Server (Ubuntu/Debian)
+Satu perintah memasang **semuanya** (installer mengesan Termux vs server
+secara automatik): Node.js (≥18), OpenJDK 17, `apktool`, `aapt`/`aapt2`,
+`zipalign`, `apksigner`, `jadx`, `dex2jar`, `unzip/zip`, `file`, `binutils`,
+`openssh` (untuk SFTP), **menjana debug keystore**, dan memasang perintah
+`suzu`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hairunnizam21/script-js/main/install.sh | bash
 ```
 
-> Di server bukan-root, pastikan `sudo` tersedia. Di Termux tidak perlu root.
+Di bawah ada panduan **langkah demi langkah** untuk Termux dan untuk server
+DigitalOcean (akses guna app **Termius**).
 
-Installer akan **mengesan** Termux vs server secara automatik dan memasang:
-Node.js (≥18), OpenJDK 17, `apktool`, `aapt`/`aapt2`, `zipalign`, `apksigner`,
-`jadx`, `dex2jar`, `unzip/zip`, `file`, `binutils`, `openssh` (untuk SFTP),
-serta **menjana debug keystore** dan memasang perintah `suzu`.
+---
 
-### Atau klon manual
+### 📱 A) Install di Termux (Android)
+
+1. Pasang **Termux** dari [F-Droid](https://f-droid.org/packages/com.termux/)
+   (versi Play Store lama — elakkan). Buka Termux.
+2. (Disyorkan) beri akses storan & kemas kini:
+   ```bash
+   termux-setup-storage
+   pkg update -y && pkg upgrade -y
+   pkg install -y curl
+   ```
+3. Jalankan pemasang satu perintah:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/hairunnizam21/script-js/main/install.sh | bash
+   ```
+4. Tetapkan token & API (interaktif):
+   ```bash
+   suzu config
+   ```
+5. **Run in background** (terus hidup selagi Termux dibuka — guna wake-lock):
+   ```bash
+   suzu start      # mula di latar belakang
+   suzu status     # semak
+   suzu logs -f    # ikut log
+   suzu stop       # henti
+   ```
+   > Tip: aktifkan **Acquire wakelock** dari notifikasi Termux supaya proses
+   > tak dibunuh Android. `suzu start` sudah cuba `termux-wake-lock` automatik.
+6. (Pilihan) akses fail guna SFTP dari komputer:
+   ```bash
+   pkg install -y openssh
+   passwd          # set kata laluan
+   sshd            # mula server SSH (port lalai 8022)
+   whoami          # nama user; IP: ip a / ifconfig
+   ```
+   Sambung: `sftp -P 8022 <user>@<ip-telefon>`.
+
+---
+
+### 🖥️ B) Install di Server DigitalOcean (akses guna Termius)
+
+**1. Buat Droplet di DigitalOcean**
+- Login [DigitalOcean](https://cloud.digitalocean.com) → **Create → Droplets**.
+- **Image:** Ubuntu 22.04 (LTS) x64.
+- **Plan:** Basic; minimum 2 GB RAM (build APK perlu RAM/CPU yang cukup).
+- **Authentication:** SSH key (disyorkan) atau Password.
+- Klik **Create Droplet**, salin **IP address** droplet.
+
+**2. Sambung guna app Termius**
+- Pasang **Termius** (Android/iOS/Desktop) → **New Host**.
+- **Address:** IP droplet · **Username:** `root` · **Port:** `22`.
+- **Password/Key:** ikut pilihan semasa buat droplet → **Connect**.
+
+**3. Pasang Suzu-JS (dalam sesi Termius)**
+```bash
+curl -fsSL https://raw.githubusercontent.com/hairunnizam21/script-js/main/install.sh | bash
+suzu config
+```
+
+**4. On / Off**
+```bash
+suzu start      # hidupkan (latar belakang)
+suzu status     # semak status + API
+suzu logs -f    # ikut log langsung
+suzu stop       # matikan
+```
+
+**5. (Disyorkan) Autostart bila reboot — systemd**
+```bash
+cp ~/script-js/systemd/suzu-bot.service /etc/systemd/system/suzu-bot@.service
+systemctl daemon-reload
+systemctl enable --now suzu-bot@$USER
+systemctl status suzu-bot@$USER
+```
+
+**6. Akses fail (download link & SFTP)**
+- **Link HTTP:** buka port server (lalai `8088`) dan, jika ada domain, set
+  `SUZU_PUBLIC_URL` (lihat [Tetapan](#-tetapan-lanjut-env)). DigitalOcean
+  Firewall: benarkan TCP `8088`.
+  ```bash
+  ufw allow 8088/tcp   # jika guna ufw
+  ```
+- **SFTP:** terus guna Termius (tab **SFTP**) atau:
+  ```bash
+  sftp root@<ip-droplet>     # kemudian: cd ~/.suzu-js/users/<id>
+  ```
+
+---
+
+### Atau klon manual (mana-mana platform)
 
 ```bash
 git clone https://github.com/hairunnizam21/script-js.git
