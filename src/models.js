@@ -31,7 +31,47 @@ function labelFor(id) {
     .replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
 
+// Guess whether an arbitrary model id is vision-capable from its name.
+export function guessVision(id) {
+  return VISION_HINTS.some((h) => String(id).toLowerCase().includes(h));
+}
+
+// Merge a base catalogue with user-added custom models. Custom entries are
+// added to (and override label/vision of) the base list, and always appear
+// even when the provider's /models endpoint doesn't list them. Returns a fresh
+// array of {id, label, vision, custom?}.
+export function mergeModels(base, custom) {
+  const out = [];
+  const byId = new Map();
+  for (const m of base || []) {
+    const entry = { ...m };
+    out.push(entry);
+    byId.set(entry.id, entry);
+  }
+  for (const c of custom || []) {
+    if (!c || !c.id) continue;
+    const existing = byId.get(c.id);
+    if (existing) {
+      if (c.label) existing.label = c.label;
+      if (c.vision !== undefined) existing.vision = !!c.vision;
+      existing.custom = true;
+    } else {
+      const entry = {
+        id: c.id,
+        label: c.label || labelFor(c.id),
+        vision: c.vision !== undefined ? !!c.vision : guessVision(c.id),
+        custom: true,
+      };
+      out.push(entry);
+      byId.set(entry.id, entry);
+    }
+  }
+  return out;
+}
+
 export async function fetchModels(cfg) {
+  const custom = Array.isArray(cfg?.customModels) ? cfg.customModels : [];
+  let base = FALLBACK_MODELS.slice();
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
@@ -50,16 +90,14 @@ export async function fetchModels(cfg) {
         id: m.id,
         label: labelFor(m.id),
         // Prefer the provider's own vision flag; fall back to name heuristics.
-        vision:
-          typeof m.vision === "boolean"
-            ? m.vision
-            : VISION_HINTS.some((h) => String(m.id).toLowerCase().includes(h)),
+        vision: typeof m.vision === "boolean" ? m.vision : guessVision(m.id),
       }));
-    if (models.length) return models;
-    throw new Error("empty model list");
+    if (models.length) base = models;
   } catch {
-    return FALLBACK_MODELS.slice();
+    // Offline / no key / custom endpoint without /models — keep the fallback.
+    base = FALLBACK_MODELS.slice();
   }
+  return mergeModels(base, custom);
 }
 
 export function isVisionModel(modelId, models) {

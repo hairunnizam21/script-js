@@ -195,12 +195,15 @@ Atau cukup guna `suzu start` / `suzu stop`.
 
 1. Tekan **Start** → banner + menu muncul.
 2. **Pilih Model** → tekan butang untuk memilih model AI (senarai diambil
-   automatik dari API anda; model vision ditanda 👁).
+   automatik dari API anda; model vision ditanda 👁, model custom ditanda ✎).
+   Senarai **auto-kemaskini** — model baru dari API muncul sendiri tanpa
+   restart (cache `SUZU_MODEL_CACHE_TTL`, lalai 5 minit). Tekan **🔄 Kemaskini
+   Senarai** untuk paksa segar, atau `/refreshmodels`.
 3. Hantar **APK** → pilih tindakan: **Analisis / Decompile / Build / Modifikasi**.
 4. Hantar **fail apa saja** (txt, gambar, zip…) → AI boleh membaca & memproses.
 5. Berbual biasa — AI ada **memori** dan **tiada had**.
 
-### Perintah
+### Perintah (user biasa)
 | Perintah | Fungsi |
 |---|---|
 | `/start` | banner + menu |
@@ -210,8 +213,26 @@ Atau cukup guna `suzu start` / `suzu stop`.
 | `/download` | pautan muat turun semua fail anda |
 | `/sftp` | maklumat akses SFTP |
 | `/reset`, `/new` | kosongkan memori chat |
-| `/setapi <url> [key]` | tukar API (admin) |
 | `/help` | bantuan |
+
+### Perintah admin 🛡️
+Taip **`/list`** untuk indeks penuh kawalan admin. Ringkasnya:
+
+| Perintah | Fungsi |
+|---|---|
+| `/list` | senarai semua kawalan admin (user biasa nampak ringkas sahaja) |
+| `/refreshmodels` | paksa kemaskini senarai model dari API |
+| `/addmodel <id> [nama]` | tambah model custom (untuk model tak auto-detect) |
+| `/delmodel <id>` | buang model custom |
+| `/setbaseurl <url>` | tukar base URL |
+| `/setkey <key>` | tukar API key |
+| `/setapi <url> [key]` | tukar base URL + key sekali |
+| `/users`, `/pending` | senarai pengguna / menunggu kelulusan |
+| `/approve <id>`, `/ban <id>`, `/unban <id>` | kelulusan pengguna |
+| `/chat <id> [n]`, `/userfiles <id>` | lihat perbualan / fail pengguna |
+
+> Butang **⚙️ Urus Model** (dalam picker model) membuka panel admin untuk
+> tambah/buang model & tukar API tanpa menaip command.
 
 ---
 

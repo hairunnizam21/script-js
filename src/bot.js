@@ -11,14 +11,14 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { loadConfig, saveEnv } from "./config.js";
+import { loadConfig, saveEnv, saveCustomModels } from "./config.js";
 import { ChatClient } from "./api.js";
 import { TelegramAPI } from "./telegram.js";
 import { UserStore } from "./store.js";
 import { buildRegistry } from "./tools/index.js";
 import { runTurn } from "./agent.js";
 import { renderSystemPrompt } from "./prompts.js";
-import { fetchModels, isVisionModel, FALLBACK_MODELS } from "./models.js";
+import { fetchModels, isVisionModel, guessVision, FALLBACK_MODELS } from "./models.js";
 import { FileServer } from "./fileserver.js";
 import { ocrImage, which } from "./tools/util.js";
 import os from "node:os";
@@ -89,6 +89,8 @@ export class SuzuBot {
     this.store = new UserStore(this.cfg.usersDir);
     this.registry = buildRegistry();
     this.models = FALLBACK_MODELS.slice();
+    this.modelsFetchedAt = 0; // epoch ms of last successful model fetch
+    this.modelTimer = null; // background auto-refresh timer
     this.pendingApk = new Map(); // userId -> filepath awaiting an action choice
     this.pendingFile = new Map(); // userId -> non-APK filepath awaiting a choice
     this.pendingDiff = new Map(); // userId -> first APK path awaiting a second to diff
@@ -229,9 +231,16 @@ export class SuzuBot {
     const me = await this.tg.getMe();
     this.cfg.telegramBotUsername = me.username || this.cfg.telegramBotUsername;
     log(`Bot @${me.username} online. API: ${this.cfg.apiBaseUrl}`);
-    // Best-effort: refresh live model list.
-    this.models = await fetchModels(this.cfg);
+    // Best-effort: refresh live model list, then keep it fresh in the
+    // background so models added to the provider show up without a restart.
+    await this.refreshModels(true);
     log(`${this.models.length} models available. Default: ${this.cfg.defaultModel}`);
+    if (this.cfg.modelCacheTtl > 0) {
+      this.modelTimer = setInterval(() => {
+        this.refreshModels(true).catch((e) => log(`model auto-refresh error: ${e.message}`));
+      }, this.cfg.modelCacheTtl);
+      if (this.modelTimer.unref) this.modelTimer.unref();
+    }
     // Capability banner so it's obvious from the logs whether the latest
     // screenshot-reading code is running (helps diagnose stale deployments).
     const ocrReady = !!which("tesseract");
@@ -263,7 +272,44 @@ export class SuzuBot {
 
   stop() {
     this.running = false;
+    if (this.modelTimer) {
+      clearInterval(this.modelTimer);
+      this.modelTimer = null;
+    }
     if (this.fileServer) this.fileServer.stop();
+  }
+
+  // Refresh the cached model list. Re-fetches only when forced or when the
+  // cache is older than `modelCacheTtl`, so the picker stays cheap but still
+  // reflects models recently added to the provider (and any custom models).
+  async refreshModels(force = false) {
+    const ttl = this.cfg.modelCacheTtl;
+    const now = Date.now();
+    if (!force && this.modelsFetchedAt && now - this.modelsFetchedAt < ttl) {
+      return this.models;
+    }
+    try {
+      const models = await fetchModels(this.cfg);
+      if (models.length) {
+        this.models = models;
+        this.modelsFetchedAt = now;
+      }
+    } catch (e) {
+      log(`refreshModels error: ${e.message}`);
+    }
+    return this.models;
+  }
+
+  // Remove a user-added custom model. Returns true if it was a custom model
+  // (live API models can't be removed here). Persists + refreshes the list.
+  async removeCustomModel(id) {
+    const before = this.cfg.customModels.length;
+    const list = this.cfg.customModels.filter((m) => m.id !== id);
+    if (list.length === before) return false;
+    this.cfg.customModels = list;
+    saveCustomModels(list, this.cfg.envFile);
+    await this.refreshModels(true);
+    return true;
   }
 
   async handleUpdate(u) {
@@ -320,6 +366,28 @@ export class SuzuBot {
       }
       case "/help": {
         await this.tg.sendMessage(chatId, this.helpText(userId), { parseMode: "Markdown" });
+        return true;
+      }
+      case "/list":
+      case "/cmds":
+      case "/commands": {
+        if (this.isAdmin(userId)) {
+          await this.tg.sendMessage(chatId, this.adminListText(), {
+            parseMode: "Markdown",
+            replyMarkup: {
+              inline_keyboard: [
+                [
+                  { text: "⚙️ Urus Model", callback_data: "model:__manage" },
+                  { text: "🛡️ Panel Admin", callback_data: "menu:admin" },
+                ],
+                [{ text: "👥 Senarai User", callback_data: "adm:users:" }],
+              ],
+            },
+          });
+        } else {
+          // Regular users get the simple command list only.
+          await this.tg.sendMessage(chatId, this.userListText(), { parseMode: "Markdown" });
+        }
         return true;
       }
       case "/menu": {
@@ -419,10 +487,124 @@ export class SuzuBot {
         this.cfg.apiBaseUrl = updates.AI_API_BASE_URL;
         if (updates.AI_API_KEY) this.cfg.apiKey = updates.AI_API_KEY;
         this.client.reconfigure({ baseUrl: this.cfg.apiBaseUrl, apiKey: this.cfg.apiKey });
-        this.models = await fetchModels(this.cfg);
+        await this.refreshModels(true);
         await this.tg.sendMessage(
           chatId,
           `✅ API dikemaskini.\nBase URL: \`${this.cfg.apiBaseUrl}\`\nModel tersedia: ${this.models.length}`,
+          { parseMode: "Markdown" },
+        );
+        return true;
+      }
+      case "/setbaseurl": {
+        if (!this.isAdmin(userId)) {
+          await this.tg.sendMessage(chatId, "⛔ Hanya admin boleh tukar API.");
+          return true;
+        }
+        const url = arg.split(/\s+/)[0];
+        if (!url) {
+          await this.tg.sendMessage(
+            chatId,
+            "Cara guna: `/setbaseurl <base_url>`\nContoh: `/setbaseurl https://api.cybersecdev.cloud/v1`",
+            { parseMode: "Markdown" },
+          );
+          return true;
+        }
+        const baseUrl = url.replace(/\/+$/, "");
+        saveEnv({ AI_API_BASE_URL: baseUrl }, this.cfg.envFile);
+        this.cfg.apiBaseUrl = baseUrl;
+        this.client.reconfigure({ baseUrl });
+        await this.refreshModels(true);
+        await this.tg.sendMessage(
+          chatId,
+          `✅ Base URL dikemaskini.\nBase URL: \`${baseUrl}\`\nModel tersedia: ${this.models.length}`,
+          { parseMode: "Markdown" },
+        );
+        return true;
+      }
+      case "/setkey": {
+        if (!this.isAdmin(userId)) {
+          await this.tg.sendMessage(chatId, "⛔ Hanya admin boleh tukar API.");
+          return true;
+        }
+        const key = arg.split(/\s+/)[0] || "";
+        if (!key) {
+          await this.tg.sendMessage(
+            chatId,
+            "Cara guna: `/setkey <api_key>`\n(guna `/setkey kosong` untuk buang key)",
+            { parseMode: "Markdown" },
+          );
+          return true;
+        }
+        const newKey = ["kosong", "none", "-"].includes(key.toLowerCase()) ? "" : key;
+        saveEnv({ AI_API_KEY: newKey }, this.cfg.envFile);
+        this.cfg.apiKey = newKey;
+        this.client.reconfigure({ apiKey: newKey });
+        await this.refreshModels(true);
+        await this.tg.sendMessage(
+          chatId,
+          `✅ API key dikemaskini (${newKey ? "diset" : "dibuang"}).\nModel tersedia: ${this.models.length}`,
+          { parseMode: "Markdown" },
+        );
+        return true;
+      }
+      case "/refreshmodels":
+      case "/refresh": {
+        await this.refreshModels(true);
+        await this.tg.sendMessage(
+          chatId,
+          `🔄 Senarai model dikemaskini. ${this.models.length} model tersedia.`,
+        );
+        await this.sendModelPicker(chatId, userId);
+        return true;
+      }
+      case "/addmodel": {
+        if (!this.isAdmin(userId)) {
+          await this.tg.sendMessage(chatId, "⛔ Hanya admin boleh urus model.");
+          return true;
+        }
+        const parts = arg.split(/\s+/).filter(Boolean);
+        if (!parts.length) {
+          await this.tg.sendMessage(
+            chatId,
+            "Cara guna: `/addmodel <id> [nama paparan]`\nContoh: `/addmodel gpt-5.5 GPT 5.5`",
+            { parseMode: "Markdown" },
+          );
+          return true;
+        }
+        const id = parts[0];
+        const label = parts.slice(1).join(" ").trim();
+        const entry = { id };
+        if (label) entry.label = label;
+        if (guessVision(id)) entry.vision = true;
+        const list = this.cfg.customModels.filter((m) => m.id !== id);
+        list.push(entry);
+        this.cfg.customModels = list;
+        saveCustomModels(list, this.cfg.envFile);
+        await this.refreshModels(true);
+        await this.tg.sendMessage(
+          chatId,
+          `✅ Model ditambah: \`${escapeMd(id)}\`${label ? ` (${escapeMd(label)})` : ""}.\nJumlah model: ${this.models.length}`,
+          { parseMode: "Markdown" },
+        );
+        return true;
+      }
+      case "/delmodel":
+      case "/removemodel": {
+        if (!this.isAdmin(userId)) {
+          await this.tg.sendMessage(chatId, "⛔ Hanya admin boleh urus model.");
+          return true;
+        }
+        const id = arg.trim();
+        if (!id) {
+          await this.tg.sendMessage(chatId, "Cara guna: `/delmodel <id>`", { parseMode: "Markdown" });
+          return true;
+        }
+        const removed = await this.removeCustomModel(id);
+        await this.tg.sendMessage(
+          chatId,
+          removed
+            ? `🗑️ Model dibuang: \`${escapeMd(id)}\`.\nJumlah model: ${this.models.length}`
+            : `⚠️ \`${escapeMd(id)}\` bukan model custom (model dari API tak boleh dibuang dari sini).`,
           { parseMode: "Markdown" },
         );
         return true;
@@ -594,6 +776,37 @@ export class SuzuBot {
       this.store.resetSession(userId);
       await this.tg.answerCallbackQuery(cq.id, "Memori dikosongkan");
       await this.tg.sendMessage(chatId, "🧹 Memori chat dikosongkan.");
+      return;
+    }
+    if (data === "model:__refresh") {
+      await this.refreshModels(true);
+      await this.tg.answerCallbackQuery(cq.id, `Dikemaskini: ${this.models.length} model`);
+      await this.sendModelPicker(chatId, userId);
+      return;
+    }
+    if (data === "model:__manage") {
+      await this.tg.answerCallbackQuery(cq.id);
+      if (!this.isAdmin(userId)) {
+        await this.tg.sendMessage(chatId, "⛔ Urus model untuk admin sahaja.");
+        return;
+      }
+      await this.sendModelManager(chatId, userId);
+      return;
+    }
+    if (data.startsWith("delmodel:")) {
+      await this.tg.answerCallbackQuery(cq.id);
+      if (!this.isAdmin(userId)) {
+        await this.tg.sendMessage(chatId, "⛔ Urus model untuk admin sahaja.");
+        return;
+      }
+      const id = data.slice("delmodel:".length);
+      const removed = await this.removeCustomModel(id);
+      await this.tg.sendMessage(
+        chatId,
+        removed ? `🗑️ Model dibuang: \`${escapeMd(id)}\`.` : `⚠️ \`${escapeMd(id)}\` bukan model custom.`,
+        { parseMode: "Markdown" },
+      );
+      await this.sendModelManager(chatId, userId);
       return;
     }
     if (data.startsWith("model:")) {
@@ -1054,18 +1267,74 @@ export class SuzuBot {
   }
 
   async sendModelPicker(chatId, userId) {
-    if (!this.models.length) this.models = await fetchModels(this.cfg);
+    // TTL-based refresh so newly-added provider models show up automatically.
+    await this.refreshModels();
+    if (!this.models.length) await this.refreshModels(true);
     const meta = this.store.getMeta(userId);
     const current = meta?.model || this.cfg.defaultModel;
     const rows = [];
     for (let i = 0; i < this.models.length; i += 2) {
       const row = this.models.slice(i, i + 2).map((m) => ({
-        text: (m.id === current ? "✅ " : "") + m.label + (m.vision ? " 👁" : ""),
+        text:
+          (m.id === current ? "✅ " : "") +
+          m.label +
+          (m.vision ? " 👁" : "") +
+          (m.custom ? " ✎" : ""),
         callback_data: `model:${m.id}`.slice(0, 64),
       }));
       rows.push(row);
     }
+    const controls = [{ text: "🔄 Kemaskini Senarai", callback_data: "model:__refresh" }];
+    if (this.isAdmin(userId)) {
+      controls.push({ text: "⚙️ Urus Model", callback_data: "model:__manage" });
+    }
+    rows.push(controls);
     await this.tg.sendMessage(chatId, `🤖 Pilih model AI (semasa: \`${current}\`):`, {
+      parseMode: "Markdown",
+      replyMarkup: { inline_keyboard: rows },
+    });
+  }
+
+  // Admin-only panel: shows the API config + custom-model catalogue with
+  // delete buttons, plus instructions to add models / change the API.
+  async sendModelManager(chatId, userId) {
+    if (!this.isAdmin(userId)) {
+      await this.tg.sendMessage(chatId, "⛔ Urus model untuk admin sahaja.");
+      return;
+    }
+    await this.refreshModels();
+    const custom = this.cfg.customModels;
+    const lines = [
+      "⚙️ *Urus Model & API*",
+      "",
+      `Base URL: \`${escapeMd(this.cfg.apiBaseUrl)}\``,
+      `API key : ${this.cfg.apiKey ? "diset ✅" : "TIDAK ⛔"}`,
+      `Jumlah model: *${this.models.length}* (custom: ${custom.length})`,
+      "",
+      "*Model custom:*",
+      custom.length
+        ? custom.map((m) => `• \`${escapeMd(m.id)}\`${m.label ? ` — ${escapeMd(m.label)}` : ""}`).join("\n")
+        : "_(tiada — semua dari API)_",
+      "",
+      "*Cara guna:*",
+      "`/addmodel <id> [nama]` — tambah model",
+      "`/delmodel <id>` — buang model custom",
+      "`/refreshmodels` — paksa kemaskini senarai",
+      "`/setbaseurl <url>` — tukar base URL",
+      "`/setkey <key>` — tukar API key",
+      "`/setapi <url> [key]` — tukar kedua-dua",
+    ];
+    const rows = [];
+    for (const m of custom) {
+      const cb = `delmodel:${m.id}`;
+      // Telegram limits callback_data to 64 bytes; skip the button for very
+      // long ids (still removable via `/delmodel <id>`).
+      if (Buffer.byteLength(cb, "utf8") <= 64) {
+        rows.push([{ text: `🗑️ ${m.label || m.id}`, callback_data: cb }]);
+      }
+    }
+    rows.push([{ text: "🔄 Kemaskini Senarai", callback_data: "model:__refresh" }]);
+    await this.tg.sendMessage(chatId, lines.join("\n"), {
       parseMode: "Markdown",
       replyMarkup: { inline_keyboard: rows },
     });
@@ -1092,20 +1361,54 @@ export class SuzuBot {
       "`/help` — bantuan ini",
     ];
     if (userId && this.isAdmin(userId)) {
-      lines.push(
-        "",
-        "*Admin:* 🛡️",
-        "`/admin` — panel admin",
-        "`/users` — senarai semua pengguna",
-        "`/pending` — permintaan menunggu kelulusan",
-        "`/approve <id>` · `/ban <id>` · `/unban <id>`",
-        "`/chat <id> [n]` — lihat perbualan pengguna",
-        "`/userfiles <id>` — fail + pautan muat turun pengguna",
-        "`/setapi <url> [key]` — tukar API",
-      );
+      lines.push("", "*Admin:* 🛡️ taip `/list` untuk semua kawalan admin.");
     }
     lines.push("", "_Memori chat aktif & tiada had permintaan._");
     return lines.join("\n");
+  }
+
+  // Simple command list for regular (non-admin) users.
+  userListText() {
+    return [
+      "*Suzu AI — Perintah*",
+      "",
+      "`/start` — banner + menu",
+      "`/models` — pilih / tukar model AI",
+      "`/status` — model & API semasa",
+      "`/files` — senarai fail anda",
+      "`/download` — pautan muat turun",
+      "`/reset` — kosongkan memori chat",
+      "`/help` — bantuan",
+      "",
+      "_Hantar mesej biasa untuk berbual, atau hantar APK/fail untuk diproses._",
+    ].join("\n");
+  }
+
+  // Full admin control index (shown by /list to admins only).
+  adminListText() {
+    return [
+      "🛡️ *Panel Kawalan Admin*",
+      "",
+      "*🤖 Model & API*",
+      "`/models` — pilih model (butang Urus Model untuk admin)",
+      "`/addmodel <id> [nama]` — tambah model custom",
+      "`/delmodel <id>` — buang model custom",
+      "`/refreshmodels` — paksa kemaskini senarai dari API",
+      "`/setbaseurl <url>` — tukar base URL",
+      "`/setkey <key>` — tukar API key",
+      "`/setapi <url> [key]` — tukar base URL + key",
+      "",
+      "*👥 Pengurusan pengguna*",
+      "`/admin` — panel admin (statistik)",
+      "`/users` — senarai semua pengguna",
+      "`/pending` — permintaan menunggu kelulusan",
+      "`/approve <id>` — luluskan pengguna",
+      "`/ban <id>` · `/unban <id>` — sekat / buka",
+      "`/chat <id> [n]` — lihat perbualan pengguna",
+      "`/userfiles <id>` — fail + pautan pengguna",
+      "",
+      "_Tip: dapatkan ID dengan `/id`. User biasa hanya nampak perintah ringkas._",
+    ].join("\n");
   }
 
   filesText(userId) {
@@ -1177,7 +1480,8 @@ export class SuzuBot {
       `API: \`${this.cfg.apiBaseUrl}\``,
       `Mesej dalam memori: *${session.messages.length}*`,
       `Workspace: \`${this.store.filesDir(userId)}\``,
-      `Model tersedia: *${this.models.length}*`,
+      `Model tersedia: *${this.models.length}*` +
+        (this.cfg.customModels.length ? ` (${this.cfg.customModels.length} custom)` : ""),
     ].join("\n");
   }
 

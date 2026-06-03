@@ -78,6 +78,46 @@ export function loadEnv(file = ENV_FILE) {
   return parsed;
 }
 
+// Parse the user-managed custom-model catalogue stored in `AI_CUSTOM_MODELS`.
+// These are models the user added by hand (e.g. ones the provider's /models
+// endpoint doesn't advertise, or that need a specific key). Stored as a JSON
+// array of {id, label?, vision?} (a bare string id is also accepted).
+export function parseCustomModels(raw) {
+  if (!raw) return [];
+  let arr;
+  try {
+    arr = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of arr) {
+    const m = typeof item === "string" ? { id: item } : item;
+    if (!m || !m.id) continue;
+    const id = String(m.id).trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const entry = { id };
+    if (m.label) entry.label = String(m.label);
+    if (m.vision) entry.vision = true;
+    out.push(entry);
+  }
+  return out;
+}
+
+// Persist the custom-model catalogue back to `.env` (compactly).
+export function saveCustomModels(list, file = ENV_FILE) {
+  const clean = (list || []).map((m) => {
+    const entry = { id: String(m.id) };
+    if (m.label) entry.label = String(m.label);
+    if (m.vision) entry.vision = true;
+    return entry;
+  });
+  return saveEnv({ AI_CUSTOM_MODELS: JSON.stringify(clean) }, file);
+}
+
 // Persist a subset of keys back to `.env`, preserving any other existing keys.
 // Used by `suzu config` and the Telegram `/setapi` / `/model` commands so the
 // API config can be swapped at runtime and survive restarts.
@@ -130,6 +170,11 @@ export function loadConfig() {
     apiBaseUrl: envStr("AI_API_BASE_URL", DEFAULT_BASE_URL).replace(/\/+$/, ""),
     apiKey: envStr("AI_API_KEY", ""),
     defaultModel: envStr("AI_DEFAULT_MODEL", DEFAULT_MODEL),
+    // User-added models, merged on top of the live /models list.
+    customModels: parseCustomModels(process.env.AI_CUSTOM_MODELS),
+    // How long (seconds) the bot caches the model list before re-fetching, so
+    // models added to the provider show up automatically without a restart.
+    modelCacheTtl: envNum("SUZU_MODEL_CACHE_TTL", 300) * 1000,
 
     // --- Telegram ---
     telegramToken: envStr("TELEGRAM_BOT_TOKEN", ""),
