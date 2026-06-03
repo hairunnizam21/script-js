@@ -116,7 +116,10 @@ function envBool(name, def) {
 
 // Default API points at the user's current provider but is fully overridable.
 const DEFAULT_BASE_URL = "https://api.cybersecdev.cloud/v1";
-const DEFAULT_MODEL = "fiq/qwen3.6-plus";
+// Bare id, matching exactly what GET /models returns (the provider also accepts
+// a "fiq/" prefix, but staying bare keeps the menu's current-model match correct
+// and is a known vision-capable model).
+const DEFAULT_MODEL = "qwen3.6-plus";
 
 export function loadConfig() {
   ensureDirs();

@@ -887,6 +887,11 @@ export class SuzuBot {
 
     let finalText = "";
     let hadError = null;
+    // runTurn does not throw on API/model failures (e.g. a model returning 403
+    // "not available", or a timeout) — it emits an "error" event and returns an
+    // empty string. Capture that here so we can surface it instead of silently
+    // replying "Selesai." (which made the bot look broken).
+    let agentError = null;
     try {
       finalText = await runTurn({
         client: this.client,
@@ -899,6 +904,7 @@ export class SuzuBot {
         onEvent: (kind, payload) => {
           if (kind === "tool_start") status.setPhase(`⚙️ ${phaseLabel(payload.name)}…`);
           else if (kind === "thinking") status.setPhase("🧠 Berfikir…");
+          else if (kind === "error") agentError = payload.error || agentError;
         },
       });
     } catch (e) {
@@ -924,7 +930,21 @@ export class SuzuBot {
       await this.deliverFile(chatId, userId, file, ctx.deliverCaptions[file]);
     }
     if (!text && !ctx.deliverables.length) {
-      await this.tg.sendMessage(chatId, "✅ Selesai.");
+      if (agentError) {
+        // A model/API failure (unavailable model, timeout, rate limit, etc.).
+        // Tell the user plainly and point them to /model instead of "Selesai.".
+        await this.tg.sendMessage(
+          chatId,
+          `⚠️ Model gagal menjawab:\n\`${String(agentError).slice(0, 300)}\`\n\n` +
+            `Model ini mungkin tak tersedia atau terlalu sibuk. Cuba hantar semula, ` +
+            `atau tukar model dengan /model.`,
+        );
+      } else {
+        await this.tg.sendMessage(
+          chatId,
+          "🤔 Model tak memberi sebarang jawapan. Cuba hantar semula atau tukar model dengan /model.",
+        );
+      }
     }
   }
 
