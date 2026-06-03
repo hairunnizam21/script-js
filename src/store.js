@@ -142,6 +142,52 @@ export class UserStore {
     }
   }
 
+  // Approval/ban state. status ∈ {"approved","pending","banned"}.
+  setStatus(userId, status) {
+    return this.setMeta(userId, { status, status_at: Date.now() });
+  }
+
+  // A compact summary used by the admin panel (counts + size + status).
+  userSummary(userId) {
+    const meta = this.getMeta(userId) || { id: String(userId) };
+    let messages = 0;
+    const session = this.readJson(this._sessionPath(userId), null);
+    if (session && Array.isArray(session.messages)) messages = session.messages.length;
+    const apk = countDir(this.apkDir(userId));
+    const files = countDir(this.filesDir(userId));
+    return {
+      id: String(userId),
+      username: meta.username || "",
+      first_name: meta.first_name || "",
+      status: meta.status || "",
+      model: meta.model || "",
+      created_at: meta.created_at || 0,
+      messages,
+      apkCount: apk.count,
+      fileCount: files.count,
+      sizeBytes: apk.size + files.size,
+    };
+  }
+
+  // Last `n` messages as plain {role, text} for admin chat inspection.
+  recentMessages(userId, n = 20) {
+    const session = this.readJson(this._sessionPath(userId), null);
+    if (!session || !Array.isArray(session.messages)) return [];
+    const flat = session.messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({
+        role: m.role,
+        text:
+          typeof m.content === "string"
+            ? m.content
+            : Array.isArray(m.content)
+              ? m.content.map((p) => p.text || "[media]").join(" ")
+              : "[tool]",
+      }))
+      .filter((m) => m.text && m.text.trim());
+    return flat.slice(-n);
+  }
+
   // --- low-level json helpers (atomic writes) ---
   readJson(file, fallback) {
     try {
@@ -200,6 +246,30 @@ export function pruneMessages(messages, { charBudget, toolResultCharCap }) {
     kept = kept.slice(1);
   }
   return kept;
+}
+
+// Count files + total bytes in a directory (one level, non-recursive enough
+// for the per-user apk/ and files/ folders).
+function countDir(dir) {
+  let count = 0;
+  let size = 0;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(".")) continue;
+      try {
+        const st = fs.statSync(path.join(dir, name));
+        if (st.isFile()) {
+          count += 1;
+          size += st.size;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return { count, size };
 }
 
 function msgLen(m) {

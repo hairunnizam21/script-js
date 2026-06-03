@@ -136,11 +136,15 @@ export function loadConfig() {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
-    // Admin user ids may run /setapi etc. Empty = same as allowed list / all.
+    // Admin user ids may run /setapi, approve/ban users, view chats, etc.
+    // Empty = same as allowed list / all.
     adminUserIds: envStr("TELEGRAM_ADMIN_USER_IDS", "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    // When on, new users start as "pending" and cannot use the AI until an
+    // admin approves them (admins are notified with Approve/Ban buttons).
+    requireApproval: envBool("SUZU_REQUIRE_APPROVAL", false),
 
     // --- Agent / behaviour ---
     requestTimeout: envNum("SUZU_REQUEST_TIMEOUT", 300) * 1000,
