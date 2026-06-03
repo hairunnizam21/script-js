@@ -122,10 +122,19 @@ export function which(name) {
 // when the selected model has no vision support).
 // --------------------------------------------------------------------------
 
-// Run tesseract OCR over an image and return the recognised text. Resolves to
-// { ok, text } on success or { ok:false, error } when tesseract is missing or
-// fails. Never throws.
-export function ocrImage(imagePath, { lang, timeout = 120000 } = {}) {
+// Score OCR output by how much "real" text it found (letters/digits). Used to
+// pick the best result across page-segmentation modes.
+function ocrScore(text) {
+  return (text.match(/[A-Za-z0-9]/g) || []).length;
+}
+
+// Run tesseract OCR over an image and return the recognised text. For higher
+// accuracy it tries several page-segmentation modes (PSM) and keeps the result
+// with the most recognised text — screenshots of errors vary a lot in layout
+// (full page, single block, sparse UI labels), so no single PSM wins for all.
+// Resolves to { ok, text, psm } on success or { ok:false, error } when
+// tesseract is missing or every attempt fails. Never throws.
+export function ocrImage(imagePath, { lang, timeout = 120000, psmModes } = {}) {
   return new Promise((resolve) => {
     const bin = which("tesseract");
     if (!bin) {
@@ -136,17 +145,36 @@ export function ocrImage(imagePath, { lang, timeout = 120000 } = {}) {
       resolve({ ok: false, error: `image not found: ${imagePath}` });
       return;
     }
-    // `tesseract <img> stdout` prints the recognised text to stdout.
-    const argv = [imagePath, "stdout"];
-    if (lang) argv.push("-l", lang);
-    runCommand({ argv: [bin, ...argv], timeout, maxChars: 20000 }).then((r) => {
-      if (r.error || r.exit_code !== 0) {
-        resolve({ ok: false, error: r.error || r.stderr || "tesseract failed" });
+    // 6=uniform block, 3=full auto page, 11=sparse text (scattered UI labels).
+    const modes = psmModes && psmModes.length ? psmModes : [6, 3, 11];
+    const langArgs = lang ? ["-l", lang] : [];
+    const per = Math.max(20000, Math.floor(timeout / modes.length));
+    const runOne = (psm) =>
+      runCommand({
+        argv: [bin, imagePath, "stdout", "--psm", String(psm), ...langArgs],
+        timeout: per,
+        maxChars: 20000,
+      }).then((r) => {
+        if (r.error || r.exit_code !== 0)
+          return { ok: false, error: r.error || r.stderr || "tesseract failed" };
+        return { ok: true, psm, text: (r.stdout || "").trim() };
+      });
+
+    (async () => {
+      const ok = [];
+      let lastErr = "";
+      for (const psm of modes) {
+        const a = await runOne(psm);
+        if (a.ok) ok.push(a);
+        else lastErr = a.error || lastErr;
+      }
+      if (!ok.length) {
+        resolve({ ok: false, error: lastErr || "tesseract failed" });
         return;
       }
-      const text = (r.stdout || "").trim();
-      resolve({ ok: true, text });
-    });
+      ok.sort((x, y) => ocrScore(y.text) - ocrScore(x.text));
+      resolve({ ok: true, text: ok[0].text, psm: ok[0].psm });
+    })();
   });
 }
 
