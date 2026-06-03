@@ -85,6 +85,10 @@ export class SuzuBot {
       apiKey: this.cfg.apiKey,
       timeout: this.cfg.requestTimeout,
     });
+    // Per-endpoint chat clients for custom models that define their own
+    // baseUrl/apiKey (a separate provider). Keyed by `${baseUrl}\0${apiKey}` so
+    // we reuse one client per distinct endpoint instead of rebuilding per turn.
+    this.clientCache = new Map();
     this.tg = new TelegramAPI(this.cfg.telegramToken);
     this.store = new UserStore(this.cfg.usersDir);
     this.registry = buildRegistry();
@@ -308,8 +312,26 @@ export class SuzuBot {
     if (list.length === before) return false;
     this.cfg.customModels = list;
     saveCustomModels(list, this.cfg.envFile);
+    this.clientCache.clear();
     await this.refreshModels(true);
     return true;
+  }
+
+  // Pick the API client used to talk to a given model. Custom models may define
+  // their own baseUrl/apiKey — those get a dedicated client so each model can
+  // use a completely separate API. Everything else uses the global client.
+  clientForModel(modelId) {
+    const m = this.models.find((x) => x.id === modelId);
+    if (!m || (!m.baseUrl && !m.apiKey)) return this.client;
+    const baseUrl = String(m.baseUrl || this.cfg.apiBaseUrl).replace(/\/+$/, "");
+    const apiKey = m.apiKey != null && m.apiKey !== "" ? m.apiKey : this.cfg.apiKey;
+    const key = `${baseUrl}\u0000${apiKey}`;
+    let client = this.clientCache.get(key);
+    if (!client) {
+      client = new ChatClient({ baseUrl, apiKey, timeout: this.cfg.requestTimeout });
+      this.clientCache.set(key, client);
+    }
+    return client;
   }
 
   async handleUpdate(u) {
@@ -487,6 +509,7 @@ export class SuzuBot {
         this.cfg.apiBaseUrl = updates.AI_API_BASE_URL;
         if (updates.AI_API_KEY) this.cfg.apiKey = updates.AI_API_KEY;
         this.client.reconfigure({ baseUrl: this.cfg.apiBaseUrl, apiKey: this.cfg.apiKey });
+        this.clientCache.clear();
         await this.refreshModels(true);
         await this.tg.sendMessage(
           chatId,
@@ -513,6 +536,7 @@ export class SuzuBot {
         saveEnv({ AI_API_BASE_URL: baseUrl }, this.cfg.envFile);
         this.cfg.apiBaseUrl = baseUrl;
         this.client.reconfigure({ baseUrl });
+        this.clientCache.clear();
         await this.refreshModels(true);
         await this.tg.sendMessage(
           chatId,
@@ -539,6 +563,7 @@ export class SuzuBot {
         saveEnv({ AI_API_KEY: newKey }, this.cfg.envFile);
         this.cfg.apiKey = newKey;
         this.client.reconfigure({ apiKey: newKey });
+        this.clientCache.clear();
         await this.refreshModels(true);
         await this.tg.sendMessage(
           chatId,
@@ -562,28 +587,59 @@ export class SuzuBot {
           await this.tg.sendMessage(chatId, "⛔ Hanya admin boleh urus model.");
           return true;
         }
-        const parts = arg.split(/\s+/).filter(Boolean);
-        if (!parts.length) {
+        const usage =
+          "Cara guna:\n" +
+          "`/addmodel <id> [nama]` — guna API global\n" +
+          "`/addmodel <id> | <nama> | <base_url> | <api_key>` — API tersendiri\n" +
+          "Contoh: `/addmodel gpt-5.5 | GPT 5.5 | https://api.openai.com/v1 | sk-xxxx`\n" +
+          "(base_url & api_key boleh dikosongkan untuk guna API global)";
+        if (!arg) {
+          await this.tg.sendMessage(chatId, usage, { parseMode: "Markdown" });
+          return true;
+        }
+        let id, label, baseUrl, apiKey;
+        if (arg.includes("|")) {
+          const p = arg.split("|").map((s) => s.trim());
+          id = p[0];
+          label = p[1] || "";
+          baseUrl = (p[2] || "").replace(/\/+$/, "");
+          apiKey = p[3] || "";
+        } else {
+          const parts = arg.split(/\s+/).filter(Boolean);
+          id = parts[0];
+          label = parts.slice(1).join(" ").trim();
+          baseUrl = "";
+          apiKey = "";
+        }
+        if (!id) {
+          await this.tg.sendMessage(chatId, usage, { parseMode: "Markdown" });
+          return true;
+        }
+        if (baseUrl && !/^https?:\/\//i.test(baseUrl)) {
           await this.tg.sendMessage(
             chatId,
-            "Cara guna: `/addmodel <id> [nama paparan]`\nContoh: `/addmodel gpt-5.5 GPT 5.5`",
+            "⚠️ base_url mesti bermula dengan `http://` atau `https://`.",
             { parseMode: "Markdown" },
           );
           return true;
         }
-        const id = parts[0];
-        const label = parts.slice(1).join(" ").trim();
         const entry = { id };
         if (label) entry.label = label;
         if (guessVision(id)) entry.vision = true;
+        if (baseUrl) entry.baseUrl = baseUrl;
+        if (apiKey) entry.apiKey = apiKey;
         const list = this.cfg.customModels.filter((m) => m.id !== id);
         list.push(entry);
         this.cfg.customModels = list;
         saveCustomModels(list, this.cfg.envFile);
+        this.clientCache.clear();
         await this.refreshModels(true);
+        const provLine = baseUrl
+          ? `\nAPI: \`${escapeMd(baseUrl)}\`${apiKey ? " (key tersendiri 🔑)" : " (key global)"}`
+          : "\nAPI: global";
         await this.tg.sendMessage(
           chatId,
-          `✅ Model ditambah: \`${escapeMd(id)}\`${label ? ` (${escapeMd(label)})` : ""}.\nJumlah model: ${this.models.length}`,
+          `✅ Model ditambah: \`${escapeMd(id)}\`${label ? ` (${escapeMd(label)})` : ""}.${provLine}\nJumlah model: ${this.models.length}`,
           { parseMode: "Markdown" },
         );
         return true;
@@ -1107,7 +1163,7 @@ export class SuzuBot {
     let agentError = null;
     try {
       finalText = await runTurn({
-        client: this.client,
+        client: this.clientForModel(session.model || this.cfg.defaultModel),
         registry: this.registry,
         ctx,
         cfg: this.cfg,
@@ -1279,6 +1335,7 @@ export class SuzuBot {
           (m.id === current ? "✅ " : "") +
           m.label +
           (m.vision ? " 👁" : "") +
+          (m.baseUrl ? " 🌐" : "") +
           (m.custom ? " ✎" : ""),
         callback_data: `model:${m.id}`.slice(0, 64),
       }));
@@ -1313,11 +1370,21 @@ export class SuzuBot {
       "",
       "*Model custom:*",
       custom.length
-        ? custom.map((m) => `• \`${escapeMd(m.id)}\`${m.label ? ` — ${escapeMd(m.label)}` : ""}`).join("\n")
-        : "_(tiada — semua dari API)_",
+        ? custom
+            .map((m) => {
+              const prov = m.baseUrl
+                ? `\n   ↳ API: \`${escapeMd(hostOf(m.baseUrl))}\`${m.apiKey ? " 🔑" : " (key global)"}`
+                : "";
+              return `• \`${escapeMd(m.id)}\`${m.label ? ` — ${escapeMd(m.label)}` : ""}${prov}`;
+            })
+            .join("\n")
+        : "_(tiada — semua dari API global)_",
+      "",
+      "_🌐 = API tersendiri · 🔑 = key sendiri · semua model lain kongsi API global._",
       "",
       "*Cara guna:*",
-      "`/addmodel <id> [nama]` — tambah model",
+      "`/addmodel <id> [nama]` — tambah (API global)",
+      "`/addmodel <id> | nama | base_url | api_key` — API tersendiri",
       "`/delmodel <id>` — buang model custom",
       "`/refreshmodels` — paksa kemaskini senarai",
       "`/setbaseurl <url>` — tukar base URL",
@@ -1391,7 +1458,8 @@ export class SuzuBot {
       "",
       "*🤖 Model & API*",
       "`/models` — pilih model (butang Urus Model untuk admin)",
-      "`/addmodel <id> [nama]` — tambah model custom",
+      "`/addmodel <id> [nama]` — tambah model custom (API global)",
+      "`/addmodel <id> | nama | base_url | api_key` — model + API tersendiri",
       "`/delmodel <id>` — buang model custom",
       "`/refreshmodels` — paksa kemaskini senarai dari API",
       "`/setbaseurl <url>` — tukar base URL",
@@ -1761,6 +1829,16 @@ function humanSize(n) {
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
+// Short host label (e.g. "api.openai.com") for showing which provider a
+// custom model points at, without dumping the whole URL.
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url).replace(/^https?:\/\//i, "").split("/")[0];
+  }
+}
+
 function escapeMd(s) {
   return String(s).replace(/([_*`\[\]])/g, "\\$1");
 }

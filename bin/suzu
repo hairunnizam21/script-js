@@ -266,9 +266,18 @@ async function cmdModels() {
   const models = await fetchModels(cfg);
   console.log(ui.line());
   for (const m of models) {
+    let host = "";
+    if (m.baseUrl) {
+      try {
+        host = new URL(m.baseUrl).host;
+      } catch {
+        host = String(m.baseUrl).replace(/^https?:\/\//i, "").split("/")[0];
+      }
+    }
     const tags =
       (m.vision ? ui.color.yellow("  👁 vision") : "") +
-      (m.custom ? ui.color.cyan("  ✎ custom") : "");
+      (m.custom ? ui.color.cyan("  ✎ custom") : "") +
+      (host ? ui.color.magenta(`  🌐 ${host}${m.apiKey ? " 🔑" : ""}`) : "");
     console.log(`  ${ui.color.green(m.id)}${tags}  ${ui.color.gray(m.label)}`);
   }
   console.log(ui.line());

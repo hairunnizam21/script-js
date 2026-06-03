@@ -38,8 +38,9 @@ export function guessVision(id) {
 
 // Merge a base catalogue with user-added custom models. Custom entries are
 // added to (and override label/vision of) the base list, and always appear
-// even when the provider's /models endpoint doesn't list them. Returns a fresh
-// array of {id, label, vision, custom?}.
+// even when the provider's /models endpoint doesn't list them. A custom entry
+// may carry its own baseUrl/apiKey so that model talks to a separate provider.
+// Returns a fresh array of {id, label, vision, custom?, baseUrl?, apiKey?}.
 export function mergeModels(base, custom) {
   const out = [];
   const byId = new Map();
@@ -54,6 +55,8 @@ export function mergeModels(base, custom) {
     if (existing) {
       if (c.label) existing.label = c.label;
       if (c.vision !== undefined) existing.vision = !!c.vision;
+      if (c.baseUrl) existing.baseUrl = c.baseUrl;
+      if (c.apiKey) existing.apiKey = c.apiKey;
       existing.custom = true;
     } else {
       const entry = {
@@ -62,6 +65,8 @@ export function mergeModels(base, custom) {
         vision: c.vision !== undefined ? !!c.vision : guessVision(c.id),
         custom: true,
       };
+      if (c.baseUrl) entry.baseUrl = c.baseUrl;
+      if (c.apiKey) entry.apiKey = c.apiKey;
       out.push(entry);
       byId.set(entry.id, entry);
     }

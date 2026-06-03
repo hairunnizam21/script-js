@@ -222,7 +222,8 @@ Taip **`/list`** untuk indeks penuh kawalan admin. Ringkasnya:
 |---|---|
 | `/list` | senarai semua kawalan admin (user biasa nampak ringkas sahaja) |
 | `/refreshmodels` | paksa kemaskini senarai model dari API |
-| `/addmodel <id> [nama]` | tambah model custom (untuk model tak auto-detect) |
+| `/addmodel <id> [nama]` | tambah model custom (guna API global) |
+| `/addmodel <id> \| nama \| base_url \| api_key` | tambah model dengan **API tersendiri** (provider berasingan) |
 | `/delmodel <id>` | buang model custom |
 | `/setbaseurl <url>` | tukar base URL |
 | `/setkey <key>` | tukar API key |
@@ -233,6 +234,19 @@ Taip **`/list`** untuk indeks penuh kawalan admin. Ringkasnya:
 
 > Butang **⚙️ Urus Model** (dalam picker model) membuka panel admin untuk
 > tambah/buang model & tukar API tanpa menaip command.
+
+**API berasingan setiap model.** Secara lalai semua model kongsi satu API
+(`AI_API_BASE_URL` + `AI_API_KEY`). Tetapi setiap model custom boleh ada base
+URL + API key **tersendiri** — jadi awak boleh campur beberapa provider (cth.
+OpenAI, provider tempatan) dalam satu bot. Bila user pilih model itu, bot
+hantar terus ke API model tersebut. Contoh:
+>
+> ```
+> /addmodel gpt-5.5 | GPT 5.5 | https://api.openai.com/v1 | sk-xxxx
+> ```
+>
+> Dalam picker, model dengan API tersendiri ditanda 🌐. Kalau `base_url`/`api_key`
+> dikosongkan, model itu guna API global. Simpanan kekal dalam `AI_CUSTOM_MODELS`.
 
 ---
 
