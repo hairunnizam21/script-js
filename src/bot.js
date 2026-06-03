@@ -27,9 +27,14 @@ import os from "node:os";
 // problem in a screenshot (the common case: a user screenshots an error).
 const IMAGE_ANALYSIS_PROMPT =
   "Pengguna menghantar gambar/screenshot (selalunya paparan RALAT/error). " +
-  "Baca SEMUA teks dalam gambar (mesej ralat, log, stack trace, kod, nama fail). " +
-  "Kenal pasti punca sebenar masalah, kemudian beri penyelesaian konkrit langkah demi langkah " +
-  "(termasuk arahan/command yang perlu dijalankan jika ada). Jika maklumat tidak cukup, tanya satu soalan ringkas.";
+  "Anda ADA dua sumber: gambar itu sendiri DAN teks OCR di bawah — guna KEDUA-DUANYA dan saling semak untuk ketepatan tinggi. " +
+  "Langkah: " +
+  "(1) Petik teks ralat TEPAT seperti tertera (mesej penuh, kod ralat, stack trace, nama fail & nombor baris). " +
+  "(2) Kenal pasti PUNCA SEBENAR (root cause), bukan sekadar gejala. " +
+  "(3) Beri penyelesaian KONKRIT langkah demi langkah, termasuk arahan/command tepat untuk dijalankan jika ada. " +
+  "(4) Jika teks kabur/terpotong atau OCR bercanggah dengan gambar, percaya gambar dan nyatakan apa yang anda nampak; " +
+  "jika maklumat masih tak cukup untuk pasti, tanya SATU soalan ringkas. " +
+  "JANGAN reka maklumat yang tiada dalam gambar.";
 
 const PHASE_LABELS = {
   shell: "Menjalankan arahan",
