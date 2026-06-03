@@ -185,6 +185,28 @@ install_dex2jar() {
 }
 install_dex2jar || true
 
+# ---- bundletool (AAB → universal installable APK) ------------------------
+install_bundletool() {
+  if command -v bundletool >/dev/null 2>&1; then ok "bundletool sudah ada."; return; fi
+  if ! command -v java >/dev/null 2>&1; then warn "java tiada — bundletool dilewatkan."; return; fi
+  say "Memasang bundletool…"
+  local VER="1.18.3"
+  local url="https://github.com/google/bundletool/releases/download/${VER}/bundletool-all-${VER}.jar"
+  local dest
+  if [ "$IS_TERMUX" -eq 1 ]; then dest="$PREFIX/opt/bundletool"; else dest="/opt/bundletool"; fi
+  $SUDO mkdir -p "$dest"
+  if $SUDO curl -fsSL "$url" -o "$dest/bundletool.jar" 2>/dev/null; then
+    # Tiny wrapper so `bundletool …` works on PATH (the AAB→APK tool calls it).
+    printf '#!/usr/bin/env bash\nexec java -jar "%s/bundletool.jar" "$@"\n' "$dest" \
+      | $SUDO tee "$BIN_DIR/bundletool" >/dev/null
+    $SUDO chmod +x "$BIN_DIR/bundletool"
+    ok "bundletool ${VER} dipasang."
+  else
+    warn "Gagal memuat turun bundletool (lewatkan). AAB→APK perlukannya."
+  fi
+}
+install_bundletool || true
+
 # ---- fetch / update the project ------------------------------------------
 # If we're already inside a clone (install.sh next to package.json), use it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"

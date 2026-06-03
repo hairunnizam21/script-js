@@ -637,6 +637,9 @@ export class SuzuBot {
           `Decompile jika perlu, betulkan, kemudian rebuild & sign supaya boleh dipasang: ${file}`,
         build: `Recompile/rebuild APK dari sumber ini dan hasilkan APK yang ditandatangani: ${file}`,
         modify: `Saya mahu ubah suai APK ini. Decompile dulu, kemudian tanya saya bahagian apa yang nak diubah: ${file}`,
+        aab:
+          `Tukar fail AAB ini menjadi APK universal yang boleh dipasang guna tool aab_to_apk, ` +
+          `kemudian sahkan (verify_apk) dan deliver APK akhir. Lapor pada peranti mana ia boleh dipasang: ${file}`,
       };
       await this.routeToAgent(chatId, userId, map[action] || `Proses APK: ${file}`);
       return;
@@ -719,6 +722,26 @@ export class SuzuBot {
         return;
       }
       this.pendingApk.set(userId, dest);
+      // An AAB can't be installed directly — lead with the convert action.
+      if (ext === ".aab") {
+        await this.tg.sendMessage(
+          chatId,
+          `📦 AAB diterima: \`${path.basename(dest)}\`\nAAB tak boleh dipasang terus. Nak buat apa?`,
+          {
+            parseMode: "Markdown",
+            replyMarkup: {
+              inline_keyboard: [
+                [{ text: "📦 Jadi APK universal (boleh install)", callback_data: "apk:aab" }],
+                [
+                  { text: "🔍 Analisis", callback_data: "apk:analyze" },
+                  { text: "🔐 Audit", callback_data: "apk:audit" },
+                ],
+              ],
+            },
+          },
+        );
+        return;
+      }
       await this.tg.sendMessage(chatId, `📦 APK diterima: \`${path.basename(dest)}\`\nNak buat apa?`, {
         parseMode: "Markdown",
         replyMarkup: {
