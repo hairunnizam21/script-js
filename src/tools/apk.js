@@ -54,6 +54,26 @@ async function apkAbis(apkPath) {
   return [...abis].sort();
 }
 
+// Verify an APK's signature with apksigner. Returns a structured result the
+// agent can use to self-check before delivering. Never throws.
+async function verifyApkSignature(apkPath) {
+  if (!which("apksigner")) return { ok: null, reason: "apksigner not installed" };
+  const r = await run(["apksigner", "verify", "--verbose", apkPath], { timeout: 120000 });
+  const text = `${r.stdout || ""}\n${r.stderr || ""}`;
+  const verified = r.exit_code === 0 && /Verified using v\d|Verifies/i.test(text);
+  const schemes = [];
+  for (const v of ["v1", "v2", "v3", "v4"]) {
+    const m = text.match(new RegExp(`scheme ${v}\\):\\s*(true|false)`, "i"));
+    if (m) schemes.push(`${v}=${m[1].toLowerCase()}`);
+  }
+  return {
+    ok: verified,
+    schemes,
+    exit_code: r.exit_code,
+    output: text.trim().slice(0, 1500),
+  };
+}
+
 function stem(p) {
   const b = path.basename(p);
   const i = b.lastIndexOf(".");
@@ -361,16 +381,58 @@ export function register(reg) {
         { timeout: 300000 },
       );
       if (sign.exit_code !== 0) return { stage: "sign", ...sign };
+      report(ctx, { percent: 95, label: "Mengesahkan APK" });
+      // Self-verify: confirm the signature is valid and report compatibility so
+      // the agent doesn't have to trust the build blindly.
+      const verification = await verifyApkSignature(out);
       report(ctx, { percent: 100, label: "APK siap" });
-      // Report device compatibility of the finished APK so the agent can tell
-      // the user which devices it installs on.
       const abis = await apkAbis(out);
       const compatibility = abis == null ? null : summarizeAbiCompatibility(abis);
       return {
         ok: true,
         out_apk: out,
+        verified: verification.ok,
+        verification,
         compatibility,
-        note: "Final signed + aligned APK ready. Call deliver to send it.",
+        note:
+          verification.ok === false
+            ? "WARNING: apksigner could not verify the signature — investigate before delivering."
+            : "Final signed + aligned APK ready and signature-verified. Call deliver to send it.",
+      };
+    },
+  });
+
+  // --------------------------------------------------------- verify_apk
+  reg.register({
+    name: "verify_apk",
+    description:
+      "Self-check a finished APK before delivering: verifies the signature (apksigner), confirms it is a valid zip, " +
+      "and reports its ABIs / device compatibility. Use this to make sure a built or signed APK is actually valid and installable.",
+    parameters: {
+      type: "object",
+      properties: { apk: { type: "string" } },
+      required: ["apk"],
+    },
+    handler: async (args, ctx) => {
+      const p = resolve(args.apk, ctx.workspace);
+      if (!fs.existsSync(p)) return { error: `apk not found: ${p}` };
+      const names = await listZip(p);
+      const valid_zip = Array.isArray(names);
+      const has_manifest = valid_zip && names.includes("AndroidManifest.xml");
+      const signature = await verifyApkSignature(p);
+      const abis = await apkAbis(p);
+      const compatibility = abis == null ? null : summarizeAbiCompatibility(abis);
+      const ok = valid_zip && has_manifest && signature.ok !== false;
+      return {
+        apk: p,
+        ok,
+        valid_zip,
+        has_manifest,
+        signature,
+        compatibility,
+        note: ok
+          ? "APK looks valid and installable."
+          : "APK failed a check — see signature/valid_zip/has_manifest above before delivering.",
       };
     },
   });
