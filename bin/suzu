@@ -188,6 +188,16 @@ async function cmdConfig() {
     "Telegram user ID yang dibenarkan (pisah koma, kosong = semua)",
     cfg.allowedUserIds.join(","),
   );
+  const admin = await ask(
+    rl,
+    "Telegram admin ID (boleh approve/ban; pisah koma)",
+    cfg.adminUserIds.join(","),
+  );
+  const approval = await ask(
+    rl,
+    "Wajib kelulusan admin untuk user baru? (on/off)",
+    cfg.requireApproval ? "on" : "off",
+  );
   rl.close();
   saveEnv(
     {
@@ -196,11 +206,58 @@ async function cmdConfig() {
       AI_API_KEY: apiKey,
       AI_DEFAULT_MODEL: model,
       TELEGRAM_ALLOWED_USER_IDS: allowed,
+      TELEGRAM_ADMIN_USER_IDS: admin,
+      SUZU_REQUIRE_APPROVAL: ["on", "1", "true", "yes"].includes(approval.toLowerCase()) ? "1" : "0",
     },
     ENV_FILE,
   );
   console.log("\n" + ui.ok("Konfigurasi disimpan."));
   console.log(ui.info("Mula bot: ") + ui.color.bold("suzu start"));
+}
+
+function cmdAdmin(rest) {
+  const cfg = loadConfig();
+  const [sub, val] = rest;
+  const admins = cfg.adminUserIds.slice();
+  switch ((sub || "list").toLowerCase()) {
+    case "add": {
+      if (!val) return console.log(ui.err("Guna: suzu admin add <telegram_id>"));
+      if (!admins.includes(String(val))) admins.push(String(val));
+      saveEnv({ TELEGRAM_ADMIN_USER_IDS: admins.join(",") }, ENV_FILE);
+      console.log(ui.ok(`Admin ditambah: ${val}`));
+      console.log(ui.info("Admin sekarang: " + (admins.join(", ") || "(tiada)")));
+      console.log(ui.warn("Mulakan semula bot supaya berkesan: ") + ui.color.bold("suzu restart"));
+      return;
+    }
+    case "remove":
+    case "rm": {
+      if (!val) return console.log(ui.err("Guna: suzu admin remove <telegram_id>"));
+      const next = admins.filter((a) => a !== String(val));
+      saveEnv({ TELEGRAM_ADMIN_USER_IDS: next.join(",") }, ENV_FILE);
+      console.log(ui.ok(`Admin dibuang: ${val}`));
+      console.log(ui.info("Admin sekarang: " + (next.join(", ") || "(tiada)")));
+      console.log(ui.warn("Mulakan semula bot: ") + ui.color.bold("suzu restart"));
+      return;
+    }
+    case "approval": {
+      const on = ["on", "1", "true", "yes"].includes(String(val || "").toLowerCase());
+      saveEnv({ SUZU_REQUIRE_APPROVAL: on ? "1" : "0" }, ENV_FILE);
+      console.log(ui.ok(`Mod kelulusan: ${on ? "ON (user baru perlu approve)" : "OFF (terbuka)"}`));
+      console.log(ui.warn("Mulakan semula bot: ") + ui.color.bold("suzu restart"));
+      return;
+    }
+    case "list":
+    default:
+      console.log(ui.banner(VERSION));
+      console.log(ui.info("Admin Telegram ID: " + (admins.join(", ") || "(tiada — semua dibenarkan)")));
+      console.log(ui.info("Mod kelulusan    : " + (cfg.requireApproval ? "ON" : "OFF")));
+      console.log("");
+      console.log(ui.color.gray("  suzu admin add <id>       lantik admin"));
+      console.log(ui.color.gray("  suzu admin remove <id>    buang admin"));
+      console.log(ui.color.gray("  suzu admin approval on|off  hidup/matikan mod kelulusan"));
+      console.log(ui.color.gray("  Tip: dapatkan ID anda dengan taip /id pada bot Telegram."));
+      return;
+  }
 }
 
 async function cmdModels() {
@@ -226,6 +283,7 @@ function cmdHelp() {
     ["suzu logs [-f]", "papar / ikut log"],
     ["suzu config", "tetapkan token & API"],
     ["suzu models", "senarai model AI"],
+    ["suzu admin", "urus admin / mod kelulusan"],
     ["suzu help", "bantuan ini"],
   ];
   for (const [c, d] of rows) {
@@ -256,6 +314,8 @@ async function main() {
       return cmdConfig();
     case "models":
       return cmdModels();
+    case "admin":
+      return cmdAdmin(rest);
     case "help":
     case "-h":
     case "--help":

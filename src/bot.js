@@ -109,6 +109,98 @@ export class SuzuBot {
     return this.isAllowed(userId);
   }
 
+  // Effective access state for a user. Admins are always approved. When
+  // approval mode is off, everyone (allowed) is approved by default.
+  userStatus(userId, meta) {
+    if (this.isAdmin(userId)) return "approved";
+    const s = (meta || this.store.getMeta(userId) || {}).status;
+    if (s === "banned" || s === "approved" || s === "pending") return s;
+    return this.cfg.requireApproval ? "pending" : "approved";
+  }
+
+  // Notify every configured admin (in their private chat) about a pending user.
+  async notifyAdminsNewUser(meta) {
+    const uname = meta.username ? `@${meta.username}` : meta.first_name || "(tiada nama)";
+    const text = [
+      "🔔 *Permintaan akses baharu*",
+      `Nama: ${escapeMd(uname)}`,
+      `ID: \`${meta.id}\``,
+      "",
+      "Luluskan pengguna ini?",
+    ].join("\n");
+    const replyMarkup = {
+      inline_keyboard: [
+        [
+          { text: "✅ Approve", callback_data: `adm:approve:${meta.id}` },
+          { text: "⛔ Ban", callback_data: `adm:ban:${meta.id}` },
+        ],
+      ],
+    };
+    for (const adminId of this.cfg.adminUserIds) {
+      try {
+        await this.tg.sendMessage(adminId, text, { parseMode: "Markdown", replyMarkup });
+      } catch {
+        /* admin may not have opened the bot yet */
+      }
+    }
+  }
+
+  // Approve / ban / unban a target user and tell them.
+  async setUserStatus(targetId, status) {
+    this.store.ensureUser(targetId, { defaultModel: this.cfg.defaultModel });
+    this.store.setStatus(targetId, status);
+    const notice =
+      status === "approved"
+        ? "✅ Akses anda telah *diluluskan*! Taip /start untuk mula."
+        : status === "banned"
+          ? "⛔ Akses anda telah *disekat* oleh admin."
+          : null;
+    if (notice) {
+      try {
+        await this.tg.sendMessage(targetId, notice, { parseMode: "Markdown" });
+      } catch {
+        /* target may not be reachable */
+      }
+    }
+  }
+
+  // Gate a non-approved user. Returns true if the message was handled here and
+  // the caller should stop. /start, /id and /help always pass through.
+  async gateAccess(chatId, userId, text, meta) {
+    const status = this.userStatus(userId, meta);
+    if (status === "banned") {
+      await this.tg.sendMessage(chatId, "⛔ Maaf, akses anda telah disekat oleh admin.");
+      return true;
+    }
+    if (status === "approved") return false;
+
+    // status === "pending" → record it once, notify admins, and allow only a
+    // couple of harmless commands through.
+    if (meta.status !== "pending") {
+      this.store.setStatus(userId, "pending");
+      meta.status = "pending";
+      await this.notifyAdminsNewUser(this.store.getMeta(userId));
+    }
+    const cmd = text.startsWith("/") ? text.split(/\s+/)[0].replace(/@.*$/, "").toLowerCase() : "";
+    if (cmd === "/start" || cmd === "/id" || cmd === "/help") return false;
+
+    await this.tg.sendMessage(
+      chatId,
+      [
+        "⏳ *Menunggu kelulusan admin.*",
+        `ID Telegram anda: \`${userId}\``,
+        "",
+        this.cfg.adminUserIds.length
+          ? "Admin sudah dimaklumkan. Sila tunggu sebentar."
+          : "Belum ada admin ditetapkan. Beritahu pemilik bot untuk jalankan `suzu admin add " +
+            userId +
+            "`.",
+      ].join("\n"),
+      { parseMode: "Markdown" },
+    );
+    return true;
+  }
+
   async start() {
     if (!this.cfg.telegramToken) {
       throw new Error("TELEGRAM_BOT_TOKEN is not set — run `suzu config`.");
@@ -160,13 +252,16 @@ export class SuzuBot {
       await this.tg.sendMessage(chatId, "⛔ Maaf, anda tidak dibenarkan menggunakan bot ini.");
       return;
     }
-    this.store.ensureUser(userId, {
+    const meta = this.store.ensureUser(userId, {
       username: from.username,
       firstName: from.first_name,
       defaultModel: this.cfg.defaultModel,
     });
 
     const text = (msg.text || msg.caption || "").trim();
+
+    // Approval / ban gate (no-op when approval mode is off and user not banned).
+    if (await this.gateAccess(chatId, userId, text, meta)) return;
 
     // Slash commands.
     if (text.startsWith("/")) {
@@ -196,11 +291,11 @@ export class SuzuBot {
         return true;
       }
       case "/help": {
-        await this.tg.sendMessage(chatId, this.helpText(), { parseMode: "Markdown" });
+        await this.tg.sendMessage(chatId, this.helpText(userId), { parseMode: "Markdown" });
         return true;
       }
       case "/menu": {
-        await this.sendMenu(chatId);
+        await this.sendMenu(chatId, userId);
         return true;
       }
       case "/model":
@@ -272,9 +367,83 @@ export class SuzuBot {
         );
         return true;
       }
+      case "/id":
+      case "/whoami": {
+        const m = this.store.getMeta(userId);
+        await this.tg.sendMessage(
+          chatId,
+          [
+            "🪪 *Maklumat anda*",
+            `ID Telegram: \`${userId}\``,
+            m?.username ? `Username: @${escapeMd(m.username)}` : null,
+            `Status: ${statusBadge(this.userStatus(userId, m))}`,
+            this.isAdmin(userId) ? "Peranan: *Admin* 🛡️" : null,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          { parseMode: "Markdown" },
+        );
+        return true;
+      }
+      case "/admin": {
+        if (!this.requireAdmin(chatId, userId)) return true;
+        await this.sendAdminPanel(chatId);
+        return true;
+      }
+      case "/users": {
+        if (!this.requireAdmin(chatId, userId)) return true;
+        await this.sendUsersList(chatId);
+        return true;
+      }
+      case "/pending": {
+        if (!this.requireAdmin(chatId, userId)) return true;
+        await this.sendPendingList(chatId);
+        return true;
+      }
+      case "/approve":
+      case "/ban":
+      case "/unban": {
+        if (!this.requireAdmin(chatId, userId)) return true;
+        const target = arg.split(/\s+/)[0].replace(/^@/, "");
+        if (!target) {
+          await this.tg.sendMessage(chatId, `Cara guna: \`${cmd} <telegram_id>\``, { parseMode: "Markdown" });
+          return true;
+        }
+        const status = cmd === "/approve" ? "approved" : cmd === "/ban" ? "banned" : "approved";
+        await this.setUserStatus(target, status);
+        const word = cmd === "/ban" ? "disekat ⛔" : cmd === "/unban" ? "dibuka semula ✅" : "diluluskan ✅";
+        await this.tg.sendMessage(chatId, `Pengguna \`${target}\` telah ${word}.`, { parseMode: "Markdown" });
+        return true;
+      }
+      case "/chat": {
+        if (!this.requireAdmin(chatId, userId)) return true;
+        const parts = arg.split(/\s+/).filter(Boolean);
+        if (!parts.length) {
+          await this.tg.sendMessage(chatId, "Cara guna: `/chat <telegram_id> [bilangan]`", { parseMode: "Markdown" });
+          return true;
+        }
+        await this.sendUserChat(chatId, parts[0].replace(/^@/, ""), parseInt(parts[1] || "20", 10));
+        return true;
+      }
+      case "/userfiles": {
+        if (!this.requireAdmin(chatId, userId)) return true;
+        const target = arg.split(/\s+/)[0].replace(/^@/, "");
+        if (!target) {
+          await this.tg.sendMessage(chatId, "Cara guna: `/userfiles <telegram_id>`", { parseMode: "Markdown" });
+          return true;
+        }
+        await this.sendUserFiles(chatId, target);
+        return true;
+      }
       default:
         return false; // unknown slash → let it reach the agent as text
     }
+  }
+
+  requireAdmin(chatId, userId) {
+    if (this.isAdmin(userId)) return true;
+    this.tg.sendMessage(chatId, "⛔ Arahan ini untuk admin sahaja.");
+    return false;
   }
 
   // ----------------------------------------------------------- callbacks
@@ -292,6 +461,55 @@ export class SuzuBot {
       defaultModel: this.cfg.defaultModel,
     });
 
+    // Admin actions (approve/ban from notifications + admin panel buttons).
+    if (data.startsWith("adm:")) {
+      if (!this.isAdmin(userId)) {
+        await this.tg.answerCallbackQuery(cq.id, "Admin sahaja");
+        return;
+      }
+      const [, action, target] = data.split(":");
+      if (action === "approve" || action === "ban" || action === "unban") {
+        const status = action === "ban" ? "banned" : "approved";
+        await this.setUserStatus(target, status);
+        const word = action === "ban" ? "disekat ⛔" : action === "unban" ? "dibuka ✅" : "diluluskan ✅";
+        await this.tg.answerCallbackQuery(cq.id, `Pengguna ${target} ${word}`);
+        await this.tg.sendMessage(chatId, `Pengguna \`${target}\` telah ${word}.`, { parseMode: "Markdown" });
+        return;
+      }
+      if (action === "users") {
+        await this.tg.answerCallbackQuery(cq.id);
+        await this.sendUsersList(chatId);
+        return;
+      }
+      if (action === "pending") {
+        await this.tg.answerCallbackQuery(cq.id);
+        await this.sendPendingList(chatId);
+        return;
+      }
+      if (action === "chat") {
+        await this.tg.answerCallbackQuery(cq.id);
+        await this.sendUserChat(chatId, target, 20);
+        return;
+      }
+      if (action === "files") {
+        await this.tg.answerCallbackQuery(cq.id);
+        await this.sendUserFiles(chatId, target);
+        return;
+      }
+      await this.tg.answerCallbackQuery(cq.id);
+      return;
+    }
+
+    if (data === "menu:admin") {
+      await this.tg.answerCallbackQuery(cq.id);
+      if (!this.isAdmin(userId)) {
+        await this.tg.sendMessage(chatId, "⛔ Arahan ini untuk admin sahaja.");
+        return;
+      }
+      await this.sendAdminPanel(chatId);
+      return;
+    }
+
     if (data === "menu:models") {
       await this.tg.answerCallbackQuery(cq.id);
       await this.sendModelPicker(chatId, userId);
@@ -299,7 +517,7 @@ export class SuzuBot {
     }
     if (data === "menu:help") {
       await this.tg.answerCallbackQuery(cq.id);
-      await this.tg.sendMessage(chatId, this.helpText(), { parseMode: "Markdown" });
+      await this.tg.sendMessage(chatId, this.helpText(userId), { parseMode: "Markdown" });
       return;
     }
     if (data === "menu:status") {
@@ -545,6 +763,15 @@ export class SuzuBot {
   async sendWelcome(chatId, userId) {
     const meta = this.store.getMeta(userId);
     const model = meta?.model || this.cfg.defaultModel;
+    const status = this.userStatus(userId, meta);
+    if (status !== "approved") {
+      const note =
+        status === "banned"
+          ? "⛔ Akses anda telah disekat oleh admin."
+          : `⏳ *Akses anda menunggu kelulusan admin.*\nID Telegram anda: \`${userId}\`\nAnda akan dimaklumkan sebaik diluluskan.`;
+      await this.tg.sendMessage(chatId, note, { parseMode: "Markdown" });
+      return;
+    }
     const banner =
       "```\n" +
       "┌──(suzu㉿kali)-[~]\n" +
@@ -566,28 +793,30 @@ export class SuzuBot {
       `Model semasa: \`${model}\``;
     await this.tg.sendMessage(chatId, banner + "\n" + body, {
       parseMode: "Markdown",
-      replyMarkup: this.menuKeyboard(),
+      replyMarkup: this.menuKeyboard(this.isAdmin(userId)),
     });
   }
 
-  menuKeyboard() {
-    return {
-      inline_keyboard: [
-        [
-          { text: "🤖 Pilih Model", callback_data: "menu:models" },
-          { text: "📊 Status", callback_data: "menu:status" },
-        ],
-        [
-          { text: "📥 Download Fail", callback_data: "menu:download" },
-          { text: "🧹 Reset Memori", callback_data: "menu:reset" },
-        ],
-        [{ text: "❓ Bantuan", callback_data: "menu:help" }],
+  menuKeyboard(isAdmin = false) {
+    const rows = [
+      [
+        { text: "🤖 Pilih Model", callback_data: "menu:models" },
+        { text: "📊 Status", callback_data: "menu:status" },
       ],
-    };
+      [
+        { text: "📥 Download Fail", callback_data: "menu:download" },
+        { text: "🧹 Reset Memori", callback_data: "menu:reset" },
+      ],
+      [{ text: "❓ Bantuan", callback_data: "menu:help" }],
+    ];
+    if (isAdmin) rows.push([{ text: "🛡️ Panel Admin", callback_data: "menu:admin" }]);
+    return { inline_keyboard: rows };
   }
 
-  async sendMenu(chatId) {
-    await this.tg.sendMessage(chatId, "📋 Menu utama:", { replyMarkup: this.menuKeyboard() });
+  async sendMenu(chatId, userId) {
+    await this.tg.sendMessage(chatId, "📋 Menu utama:", {
+      replyMarkup: this.menuKeyboard(this.isAdmin(userId)),
+    });
   }
 
   async sendModelPicker(chatId, userId) {
@@ -608,8 +837,8 @@ export class SuzuBot {
     });
   }
 
-  helpText() {
-    return [
+  helpText(userId) {
+    const lines = [
       "*Suzu AI — Bantuan*",
       "",
       "Hantar mesej biasa untuk berbual / beri tugasan.",
@@ -622,13 +851,26 @@ export class SuzuBot {
       "`/files` — senarai fail (chat/apk/files)",
       "`/download` — pautan muat turun semua fail anda",
       "`/sftp` — maklumat akses SFTP",
+      "`/id` — papar ID Telegram anda",
       "`/reset` — kosongkan memori chat",
       "`/new` — mula sesi baharu",
-      "`/setapi <url> [key]` — tukar API (admin)",
       "`/help` — bantuan ini",
-      "",
-      "_Memori chat aktif & tiada had permintaan._",
-    ].join("\n");
+    ];
+    if (userId && this.isAdmin(userId)) {
+      lines.push(
+        "",
+        "*Admin:* 🛡️",
+        "`/admin` — panel admin",
+        "`/users` — senarai semua pengguna",
+        "`/pending` — permintaan menunggu kelulusan",
+        "`/approve <id>` · `/ban <id>` · `/unban <id>`",
+        "`/chat <id> [n]` — lihat perbualan pengguna",
+        "`/userfiles <id>` — fail + pautan muat turun pengguna",
+        "`/setapi <url> [key]` — tukar API",
+      );
+    }
+    lines.push("", "_Memori chat aktif & tiada had permintaan._");
+    return lines.join("\n");
   }
 
   filesText(userId) {
@@ -702,6 +944,135 @@ export class SuzuBot {
       `Workspace: \`${this.store.filesDir(userId)}\``,
       `Model tersedia: *${this.models.length}*`,
     ].join("\n");
+  }
+
+  // ----------------------------------------------------------- admin panel
+  async sendAdminPanel(chatId) {
+    const ids = this.store.listUsers();
+    let pending = 0;
+    let banned = 0;
+    for (const id of ids) {
+      const s = this.store.getMeta(id)?.status;
+      if (s === "pending") pending += 1;
+      else if (s === "banned") banned += 1;
+    }
+    const text = [
+      "🛡️ *Panel Admin Suzu*",
+      "",
+      `Jumlah pengguna: *${ids.length}*`,
+      `Menunggu kelulusan: *${pending}*`,
+      `Disekat: *${banned}*`,
+      `Mod kelulusan: ${this.cfg.requireApproval ? "*ON* (user baru perlu approve)" : "*OFF* (terbuka)"}`,
+      "",
+      "Arahan: `/approve <id>`, `/ban <id>`, `/unban <id>`, `/chat <id>`, `/userfiles <id>`",
+    ].join("\n");
+    await this.tg.sendMessage(chatId, text, {
+      parseMode: "Markdown",
+      replyMarkup: {
+        inline_keyboard: [
+          [
+            { text: `⏳ Pending (${pending})`, callback_data: "adm:pending:" },
+            { text: "👥 Semua User", callback_data: "adm:users:" },
+          ],
+        ],
+      },
+    });
+  }
+
+  async sendUsersList(chatId) {
+    const ids = this.store.listUsers();
+    if (!ids.length) {
+      await this.tg.sendMessage(chatId, "Belum ada pengguna.");
+      return;
+    }
+    const rows = ids
+      .map((id) => this.store.userSummary(id))
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    const lines = ["👥 *Senarai pengguna*", ""];
+    for (const u of rows.slice(0, 50)) {
+      const name = u.username ? `@${escapeMd(u.username)}` : escapeMd(u.first_name || "-");
+      lines.push(
+        `${statusBadge(this.userStatus(u.id, u))} \`${u.id}\` ${name}\n` +
+          `   💬 ${u.messages} • 📦 ${u.apkCount} apk • 📄 ${u.fileCount} fail • ${humanSize(u.sizeBytes)}`,
+      );
+    }
+    if (rows.length > 50) lines.push(`… dan ${rows.length - 50} lagi`);
+    lines.push("", "Tekan/taip `/chat <id>` untuk lihat perbualan.");
+    await this.tg.sendMessage(chatId, lines.join("\n"), { parseMode: "Markdown" });
+  }
+
+  async sendPendingList(chatId) {
+    const ids = this.store.listUsers().filter((id) => this.store.getMeta(id)?.status === "pending");
+    if (!ids.length) {
+      await this.tg.sendMessage(chatId, "✅ Tiada permintaan menunggu kelulusan.");
+      return;
+    }
+    for (const id of ids.slice(0, 20)) {
+      const u = this.store.userSummary(id);
+      const name = u.username ? `@${escapeMd(u.username)}` : escapeMd(u.first_name || "-");
+      await this.tg.sendMessage(chatId, `⏳ \`${u.id}\` ${name}`, {
+        parseMode: "Markdown",
+        replyMarkup: {
+          inline_keyboard: [
+            [
+              { text: "✅ Approve", callback_data: `adm:approve:${u.id}` },
+              { text: "⛔ Ban", callback_data: `adm:ban:${u.id}` },
+            ],
+          ],
+        },
+      });
+    }
+  }
+
+  async sendUserChat(chatId, targetId, n) {
+    if (!this.store.getMeta(targetId)) {
+      await this.tg.sendMessage(chatId, `Pengguna \`${targetId}\` tidak dijumpai.`, { parseMode: "Markdown" });
+      return;
+    }
+    const limit = Number.isFinite(n) && n > 0 ? Math.min(n, 60) : 20;
+    const msgs = this.store.recentMessages(targetId, limit);
+    const u = this.store.userSummary(targetId);
+    const name = u.username ? `@${u.username}` : u.first_name || "-";
+    if (!msgs.length) {
+      await this.tg.sendMessage(chatId, `💬 \`${targetId}\` (${name}) belum ada perbualan.`, { parseMode: "Markdown" });
+      return;
+    }
+    const header = `💬 *Perbualan ${escapeMd(name)}* \`${targetId}\` (${msgs.length} mesej terakhir)\n`;
+    const body = msgs
+      .map((m) => {
+        const who = m.role === "user" ? "👤" : "🤖";
+        let t = m.text.replace(/\s+/g, " ").trim();
+        if (t.length > 400) t = t.slice(0, 400) + "…";
+        return `${who} ${t}`;
+      })
+      .join("\n\n");
+    // Reuse the chat splitter in TelegramAPI.sendMessage (it chunks long text).
+    await this.tg.sendMessage(chatId, header + "\n" + body);
+  }
+
+  async sendUserFiles(chatId, targetId) {
+    if (!this.store.getMeta(targetId)) {
+      await this.tg.sendMessage(chatId, `Pengguna \`${targetId}\` tidak dijumpai.`, { parseMode: "Markdown" });
+      return;
+    }
+    const section = (label, dir) => {
+      let items = [];
+      try {
+        items = fs.readdirSync(dir).filter((f) => !f.startsWith(".")).slice(0, 30);
+      } catch {
+        /* ignore */
+      }
+      return `*${label}* (${items.length})\n` + (items.map((f) => `• ${escapeMd(f)}`).join("\n") || "_(kosong)_");
+    };
+    const link = this.downloadLink(targetId);
+    const lines = [
+      `📂 *Fail pengguna* \`${targetId}\``,
+      section("apk/", this.store.apkDir(targetId)),
+      section("files/", this.store.filesDir(targetId)),
+    ];
+    if (link) lines.push("", `🔗 Muat turun: ${link}`);
+    lines.push(`📁 SFTP: \`${this.store.userDir(targetId)}\``);
+    await this.tg.sendMessage(chatId, lines.join("\n\n"), { parseMode: "Markdown" });
   }
 }
 
@@ -779,4 +1150,10 @@ function humanSize(n) {
 }
 function escapeMd(s) {
   return String(s).replace(/([_*`\[\]])/g, "\\$1");
+}
+function statusBadge(status) {
+  if (status === "approved") return "✅ approved";
+  if (status === "pending") return "⏳ pending";
+  if (status === "banned") return "⛔ banned";
+  return "• " + (status || "—");
 }
