@@ -81,7 +81,9 @@ export function loadEnv(file = ENV_FILE) {
 // Parse the user-managed custom-model catalogue stored in `AI_CUSTOM_MODELS`.
 // These are models the user added by hand (e.g. ones the provider's /models
 // endpoint doesn't advertise, or that need a specific key). Stored as a JSON
-// array of {id, label?, vision?} (a bare string id is also accepted).
+// array of {id, label?, vision?, baseUrl?, apiKey?} (a bare string id is also
+// accepted). When an entry sets baseUrl/apiKey it points at its OWN provider,
+// so each model can use a separate API instead of all sharing one.
 export function parseCustomModels(raw) {
   if (!raw) return [];
   let arr;
@@ -102,6 +104,8 @@ export function parseCustomModels(raw) {
     const entry = { id };
     if (m.label) entry.label = String(m.label);
     if (m.vision) entry.vision = true;
+    if (m.baseUrl) entry.baseUrl = String(m.baseUrl).replace(/\/+$/, "");
+    if (m.apiKey) entry.apiKey = String(m.apiKey);
     out.push(entry);
   }
   return out;
@@ -113,6 +117,8 @@ export function saveCustomModels(list, file = ENV_FILE) {
     const entry = { id: String(m.id) };
     if (m.label) entry.label = String(m.label);
     if (m.vision) entry.vision = true;
+    if (m.baseUrl) entry.baseUrl = String(m.baseUrl).replace(/\/+$/, "");
+    if (m.apiKey) entry.apiKey = String(m.apiKey);
     return entry;
   });
   return saveEnv({ AI_CUSTOM_MODELS: JSON.stringify(clean) }, file);
