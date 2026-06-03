@@ -113,6 +113,63 @@ export function buildRegistry() {
     },
   });
 
+  // remember / forget / list_memory — durable per-user memory across sessions.
+  reg.register({
+    name: "remember",
+    description:
+      "Save a DURABLE fact or preference about THIS user so future sessions honour it " +
+      "(e.g. 'default build arm64-only', 'package is com.foo.bar', 'sign with keystore X', 'prefers Malay'). " +
+      "Persists across chats and is shown to you next time under 'Long-term memory about this user'. " +
+      "Use for lasting preferences/project facts only — NOT one-off task details, and NEVER secrets/passwords.",
+    parameters: {
+      type: "object",
+      properties: {
+        fact: { type: "string", description: "One concise sentence to remember." },
+      },
+      required: ["fact"],
+    },
+    handler: async (args, ctx) => {
+      const fact = String(args.fact || "").trim();
+      if (!fact) return { error: "`fact` is required" };
+      if (!ctx?.memory?.add) return { error: "memory not available in this context" };
+      const item = ctx.memory.add(fact);
+      if (!item) return { error: "could not save (empty fact)" };
+      return { ok: true, remembered: item.text };
+    },
+  });
+
+  reg.register({
+    name: "forget",
+    description:
+      "Remove a saved long-term memory for this user, matched by id or text substring. " +
+      "Use when a preference changes or the user asks to forget something.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Memory id, or text substring to match." },
+      },
+      required: ["query"],
+    },
+    handler: async (args, ctx) => {
+      const q = String(args.query || "").trim();
+      if (!q) return { error: "`query` is required" };
+      if (!ctx?.memory?.remove) return { error: "memory not available in this context" };
+      const removed = ctx.memory.remove(q);
+      return { ok: true, removed };
+    },
+  });
+
+  reg.register({
+    name: "list_memory",
+    description: "List the durable facts/preferences currently saved for this user.",
+    parameters: { type: "object", properties: {} },
+    handler: async (args, ctx) => {
+      if (!ctx?.memory?.list) return { error: "memory not available in this context" };
+      const items = ctx.memory.list();
+      return { ok: true, count: items.length, items: items.map((m) => ({ id: m.id, text: m.text })) };
+    },
+  });
+
   // deliver — the only way a file reaches the user over Telegram.
   reg.register({
     name: "deliver",

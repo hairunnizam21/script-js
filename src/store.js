@@ -119,6 +119,54 @@ export class UserStore {
     this.writeJson(this._sessionPath(userId), session);
   }
 
+  // --- long-term memory (durable facts/preferences, survive /reset) ---
+  _memoryPath(userId) {
+    return path.join(this.userDir(userId), "memory.json");
+  }
+
+  loadMemory(userId) {
+    const data = this.readJson(this._memoryPath(userId), null);
+    return data && Array.isArray(data.items) ? data.items : [];
+  }
+
+  // Save a durable fact. Dedupes (case-insensitive) and keeps the newest 50.
+  addMemory(userId, text) {
+    const clean = String(text || "").trim().slice(0, 500);
+    if (!clean) return null;
+    const items = this.loadMemory(userId);
+    const existing = items.find((m) => m.text.toLowerCase() === clean.toLowerCase());
+    if (existing) return existing;
+    const item = { id: crypto.randomBytes(4).toString("hex"), text: clean, created_at: Date.now() };
+    items.push(item);
+    this.writeJson(this._memoryPath(userId), { items: items.slice(-50) });
+    return item;
+  }
+
+  // Remove memory whose id equals, or whose text contains, the query. Returns
+  // how many entries were removed.
+  removeMemory(userId, query) {
+    const q = String(query || "").trim().toLowerCase();
+    if (!q) return 0;
+    const items = this.loadMemory(userId);
+    const kept = items.filter(
+      (m) => m.id.toLowerCase() !== q && !m.text.toLowerCase().includes(q),
+    );
+    const removed = items.length - kept.length;
+    if (removed) this.writeJson(this._memoryPath(userId), { items: kept });
+    return removed;
+  }
+
+  clearMemory(userId) {
+    this.writeJson(this._memoryPath(userId), { items: [] });
+  }
+
+  // Bullet list of saved facts for injection into the system prompt ("" if none).
+  memoryText(userId) {
+    const items = this.loadMemory(userId);
+    if (!items.length) return "";
+    return items.map((m) => `- ${m.text}`).join("\n");
+  }
+
   // Clear chat memory but keep the user's files.
   resetSession(userId) {
     const data = {
