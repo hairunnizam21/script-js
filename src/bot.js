@@ -62,6 +62,8 @@ const PHASE_LABELS = {
   ocr_image: "Membaca teks dalam gambar (OCR)",
   verify_apk: "Mengesahkan APK",
   update_plan: "Mengemas kini pelan",
+  apk_audit: "Mengaudit keselamatan APK",
+  apk_diff: "Membanding dua APK",
 };
 
 function phaseLabel(name) {

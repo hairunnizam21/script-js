@@ -74,6 +74,104 @@ async function verifyApkSignature(apkPath) {
   };
 }
 
+// Android runtime ("dangerous") permission groups worth flagging in an audit.
+const DANGEROUS_PERMS = new Set([
+  "READ_CONTACTS", "WRITE_CONTACTS", "GET_ACCOUNTS",
+  "READ_CALENDAR", "WRITE_CALENDAR",
+  "CAMERA", "RECORD_AUDIO",
+  "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION", "ACCESS_BACKGROUND_LOCATION",
+  "READ_PHONE_STATE", "READ_PHONE_NUMBERS", "CALL_PHONE", "ANSWER_PHONE_CALLS",
+  "READ_CALL_LOG", "WRITE_CALL_LOG", "PROCESS_OUTGOING_CALLS",
+  "BODY_SENSORS",
+  "SEND_SMS", "RECEIVE_SMS", "READ_SMS", "RECEIVE_WAP_PUSH", "RECEIVE_MMS",
+  "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE", "MANAGE_EXTERNAL_STORAGE",
+  "ACCESS_MEDIA_LOCATION", "ACTIVITY_RECOGNITION",
+]);
+
+// Known third-party SDKs / trackers, detected by class-path prefixes inside the
+// dex (we match against the zip entry list + smali-style package roots).
+const TRACKER_SIGNATURES = [
+  { name: "Google Firebase", re: /(^|\/)com\/google\/firebase\// },
+  { name: "Google Play Services", re: /(^|\/)com\/google\/android\/gms\// },
+  { name: "Google AdMob/Ads", re: /(^|\/)com\/google\/android\/gms\/ads\// },
+  { name: "Facebook SDK", re: /(^|\/)com\/facebook\// },
+  { name: "AppsFlyer", re: /(^|\/)com\/appsflyer\// },
+  { name: "Adjust", re: /(^|\/)com\/adjust\/sdk\// },
+  { name: "Flurry", re: /(^|\/)com\/flurry\// },
+  { name: "Crashlytics", re: /(^|\/)com\/(crashlytics|google\/firebase\/crashlytics)\// },
+  { name: "OneSignal", re: /(^|\/)com\/onesignal\// },
+  { name: "Unity Ads", re: /(^|\/)com\/unity3d\/ads\// },
+  { name: "ironSource", re: /(^|\/)com\/ironsource\// },
+  { name: "AppLovin", re: /(^|\/)com\/applovin\// },
+  { name: "Branch", re: /(^|\/)io\/branch\// },
+  { name: "Sentry", re: /(^|\/)io\/sentry\// },
+  { name: "Amplitude", re: /(^|\/)com\/amplitude\// },
+  { name: "Mixpanel", re: /(^|\/)com\/mixpanel\// },
+];
+
+// Parse `aapt dump badging` into a structured object (package/version/sdk,
+// permissions, features, debuggable flag). Returns null if aapt is unavailable.
+async function aaptBadging(apkPath) {
+  const aapt = which("aapt2") || which("aapt");
+  if (!aapt) return null;
+  const info = await run([aapt, "dump", "badging", apkPath], { timeout: 120000 });
+  const out = info.stdout || "";
+  if (!out) return null;
+  const res = { permissions: [], features: [] };
+  let m = out.match(/package: name='([^']+)' versionCode='([^']*)' versionName='([^']*)'/);
+  if (m) {
+    res.package = m[1];
+    res.version_code = m[2];
+    res.version_name = m[3];
+  }
+  m = out.match(/sdkVersion:'([^']+)'/);
+  if (m) res.min_sdk = m[1];
+  m = out.match(/targetSdkVersion:'([^']+)'/);
+  if (m) res.target_sdk = m[1];
+  const perms = new Set();
+  for (const pm of out.matchAll(/uses-permission: name='([^']+)'/g)) perms.add(pm[1]);
+  res.permissions = [...perms].sort();
+  const feats = new Set();
+  for (const fm of out.matchAll(/uses-feature(?:-not-required)?: name='([^']+)'/g)) feats.add(fm[1]);
+  res.features = [...feats].sort();
+  res.debuggable = /application-debuggable/.test(out);
+  return res;
+}
+
+// Split permissions into dangerous vs normal by their short name.
+function classifyPermissions(perms) {
+  const dangerous = [];
+  for (const p of perms || []) {
+    const short = p.split(".").pop();
+    if (DANGEROUS_PERMS.has(short)) dangerous.push(p);
+  }
+  return dangerous.sort();
+}
+
+// Detect known trackers/SDKs from a zip entry list (test each entry name so the
+// (^|/) anchor works regardless of position).
+function detectTrackers(names) {
+  const list = names || [];
+  const found = [];
+  for (const t of TRACKER_SIGNATURES) {
+    if (list.some((n) => t.re.test(n))) found.push(t.name);
+  }
+  return [...new Set(found)];
+}
+
+// `unzip -v` → map of entry name -> crc, for content diffing.
+async function zipCrcMap(apkPath) {
+  const r = await runCommand({ argv: ["unzip", "-v", apkPath], timeout: 120000, maxChars: 800000 });
+  if (r.error || r.exit_code !== 0) return null;
+  const map = new Map();
+  for (const line of (r.stdout || "").split("\n")) {
+    // columns: Length Method Size Cmpr Date Time CRC-32 Name
+    const m = line.match(/^\s*\d+\s+\S+\s+\d+\s+\S+\s+\S+\s+\S+\s+([0-9a-fA-F]{8})\s+(.+)$/);
+    if (m) map.set(m[2].trim(), m[1].toLowerCase());
+  }
+  return map;
+}
+
 function stem(p) {
   const b = path.basename(p);
   const i = b.lastIndexOf(".");
@@ -433,6 +531,122 @@ export function register(reg) {
         note: ok
           ? "APK looks valid and installable."
           : "APK failed a check — see signature/valid_zip/has_manifest above before delivering.",
+      };
+    },
+  });
+
+  // --------------------------------------------------------- apk_audit
+  reg.register({
+    name: "apk_audit",
+    description:
+      "Security/privacy audit of an APK: lists permissions (flagging dangerous ones), detects known trackers/ad SDKs, " +
+      "reports debuggable/signature status, package/version/SDK info, and device (ABI) compatibility. " +
+      "Use this to tell the user what an app can access and whether it looks safe/legit.",
+    parameters: {
+      type: "object",
+      properties: { apk: { type: "string" } },
+      required: ["apk"],
+    },
+    handler: async (args, ctx) => {
+      const p = resolve(args.apk, ctx.workspace);
+      if (!fs.existsSync(p)) return { error: `apk not found: ${p}` };
+      const names = (await listZip(p)) || [];
+      const badging = await aaptBadging(p);
+      const permissions = badging?.permissions || [];
+      const dangerous = classifyPermissions(permissions);
+      const trackers = detectTrackers(names);
+      const abis = await apkAbis(p);
+      const compatibility = abis == null ? null : summarizeAbiCompatibility(abis);
+      const signature = await verifyApkSignature(p);
+
+      const warnings = [];
+      if (badging?.debuggable) warnings.push("APK debuggable (android:debuggable=true) — tidak sesuai untuk edaran.");
+      if (signature.ok === false) warnings.push("Tandatangan tidak sah / tidak ditandatangani.");
+      if (dangerous.length >= 6) warnings.push(`Banyak permission sensitif (${dangerous.length}).`);
+      if (trackers.length) warnings.push(`Mengandungi tracker/SDK pihak ketiga: ${trackers.join(", ")}.`);
+
+      return {
+        apk: p,
+        package: badging?.package,
+        version_name: badging?.version_name,
+        version_code: badging?.version_code,
+        min_sdk: badging?.min_sdk,
+        target_sdk: badging?.target_sdk,
+        debuggable: badging?.debuggable ?? null,
+        permissions,
+        dangerous_permissions: dangerous,
+        permission_count: permissions.length,
+        trackers,
+        signature: { ok: signature.ok, schemes: signature.schemes },
+        compatibility,
+        warnings,
+        note: badging
+          ? warnings.length
+            ? "Audit siap — ada perkara untuk diberi perhatian (lihat warnings)."
+            : "Audit siap — tiada isu jelas dikesan."
+          : "aapt tidak dipasang — permission/version tidak dapat dibaca; jalankan install.sh. (Tracker & ABI masih dilaporkan.)",
+      };
+    },
+  });
+
+  // ---------------------------------------------------------- apk_diff
+  reg.register({
+    name: "apk_diff",
+    description:
+      "Compare two APKs and report what changed: package/version, permissions added/removed, ABIs added/removed, " +
+      "and files added/removed/modified (by CRC). Useful for auditing a mod vs the original or two app versions.",
+    parameters: {
+      type: "object",
+      properties: { apk_a: { type: "string" }, apk_b: { type: "string" } },
+      required: ["apk_a", "apk_b"],
+    },
+    handler: async (args, ctx) => {
+      const a = resolve(args.apk_a, ctx.workspace);
+      const b = resolve(args.apk_b, ctx.workspace);
+      if (!fs.existsSync(a)) return { error: `apk not found: ${a}` };
+      if (!fs.existsSync(b)) return { error: `apk not found: ${b}` };
+
+      const [ba, bb] = [await aaptBadging(a), await aaptBadging(b)];
+      const permsA = new Set(ba?.permissions || []);
+      const permsB = new Set(bb?.permissions || []);
+      const [abisA, abisB] = [(await apkAbis(a)) || [], (await apkAbis(b)) || []];
+      const setA = new Set(abisA);
+      const setB = new Set(abisB);
+      const [crcA, crcB] = [await zipCrcMap(a), await zipCrcMap(b)];
+
+      const diffSets = (from, to) => [...to].filter((x) => !from.has(x)).sort();
+      let filesAdded = [];
+      let filesRemoved = [];
+      let filesModified = [];
+      if (crcA && crcB) {
+        for (const n of crcB.keys()) if (!crcA.has(n)) filesAdded.push(n);
+        for (const n of crcA.keys()) if (!crcB.has(n)) filesRemoved.push(n);
+        for (const [n, c] of crcA) if (crcB.has(n) && crcB.get(n) !== c) filesModified.push(n);
+        filesAdded.sort();
+        filesRemoved.sort();
+        filesModified.sort();
+      }
+      const cap = (arr, n = 60) =>
+        arr.length > n ? { count: arr.length, sample: arr.slice(0, n) } : { count: arr.length, list: arr };
+
+      return {
+        apk_a: a,
+        apk_b: b,
+        version: {
+          a: { name: ba?.version_name, code: ba?.version_code },
+          b: { name: bb?.version_name, code: bb?.version_code },
+        },
+        permissions_added: diffSets(permsA, permsB),
+        permissions_removed: diffSets(permsB, permsA),
+        abis_added: diffSets(setA, setB),
+        abis_removed: diffSets(setB, setA),
+        files_added: cap(filesAdded),
+        files_removed: cap(filesRemoved),
+        files_modified: cap(filesModified),
+        note:
+          crcA && crcB
+            ? "Perbandingan siap."
+            : "Tidak dapat baca isi zip salah satu APK untuk diff fail (permission/ABI/versi masih dibanding).",
       };
     },
   });
