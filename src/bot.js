@@ -85,6 +85,8 @@ export class SuzuBot {
     this.registry = buildRegistry();
     this.models = FALLBACK_MODELS.slice();
     this.pendingApk = new Map(); // userId -> filepath awaiting an action choice
+    this.pendingFile = new Map(); // userId -> non-APK filepath awaiting a choice
+    this.pendingDiff = new Map(); // userId -> first APK path awaiting a second to diff
     this.busy = new Set(); // userIds with a turn in flight
     this.running = false;
     this.offset = 0;
@@ -575,14 +577,48 @@ export class SuzuBot {
         await this.tg.sendMessage(chatId, "Fail APK tidak dijumpai lagi, sila hantar semula.");
         return;
       }
+      // "Diff" needs a second APK — stash this one and wait for the next upload.
+      if (action === "diff") {
+        this.pendingApk.delete(userId);
+        this.pendingDiff.set(userId, file);
+        await this.tg.sendMessage(
+          chatId,
+          `📊 Hantar APK *kedua* untuk dibandingkan dengan \`${path.basename(file)}\`.`,
+          { parseMode: "Markdown" },
+        );
+        return;
+      }
       this.pendingApk.delete(userId);
       const map = {
         analyze: `Analisis penuh APK ini (framework, package, permission, library): ${file}`,
+        audit:
+          `Jalankan audit keselamatan & privasi APK ini guna tool apk_audit — senaraikan permission (tanda yang bahaya), ` +
+          `kesan tracker/SDK, status debuggable & tandatangan, dan keserasian ABI. Ringkaskan sama ada selamat: ${file}`,
         decompile: `Decompile APK ini dengan apktool dan ringkaskan strukturnya: ${file}`,
+        fix:
+          `Periksa APK ini dan baiki masalah biasa (cth tak boleh install, ABI tak serasi, tandatangan rosak/tiada). ` +
+          `Decompile jika perlu, betulkan, kemudian rebuild & sign supaya boleh dipasang: ${file}`,
         build: `Recompile/rebuild APK dari sumber ini dan hasilkan APK yang ditandatangani: ${file}`,
         modify: `Saya mahu ubah suai APK ini. Decompile dulu, kemudian tanya saya bahagian apa yang nak diubah: ${file}`,
       };
       await this.routeToAgent(chatId, userId, map[action] || `Proses APK: ${file}`);
+      return;
+    }
+    if (data.startsWith("file:")) {
+      const action = data.slice("file:".length);
+      await this.tg.answerCallbackQuery(cq.id);
+      const file = this.pendingFile.get(userId);
+      if (!file) {
+        await this.tg.sendMessage(chatId, "Fail tidak dijumpai lagi, sila hantar semula.");
+        return;
+      }
+      this.pendingFile.delete(userId);
+      const map = {
+        analyze: `Analisis kandungan fail ini dan terangkan apa isinya: ${file}`,
+        scan: `Periksa fail ini untuk ralat/isu/amaran dan cadangkan pembetulan yang konkrit: ${file}`,
+        summary: `Ringkaskan kandungan fail ini secara padat dan jelas: ${file}`,
+      };
+      await this.routeToAgent(chatId, userId, map[action] || `Analisis fail: ${file}`);
       return;
     }
     await this.tg.answerCallbackQuery(cq.id);
@@ -626,19 +662,43 @@ export class SuzuBot {
 
     // APK → professional quick-action buttons.
     if (ext === ".apk" || ext === ".aab" || ext === ".xapk") {
+      // Waiting for a second APK to diff against the first one.
+      const diffBase = this.pendingDiff.get(userId);
+      if (diffBase) {
+        this.pendingDiff.delete(userId);
+        await this.routeToAgent(
+          chatId,
+          userId,
+          `Banding dua APK ini guna tool apk_diff dan ringkaskan perbezaan (versi, permission, ABI, fail berubah). ` +
+            `APK A: ${diffBase}\nAPK B: ${dest}`,
+        );
+        return;
+      }
+      // If the user already said what to do (caption), act directly — don't be rigid.
+      if (caption && caption.trim()) {
+        await this.routeToAgent(chatId, userId, `${caption.trim()}\n\nFail APK: ${dest}`, {
+          replyTo: msg.message_id,
+        });
+        return;
+      }
       this.pendingApk.set(userId, dest);
-      await this.tg.sendMessage(chatId, `📦 APK diterima: \`${path.basename(dest)}\`\nPilih tindakan:`, {
+      await this.tg.sendMessage(chatId, `📦 APK diterima: \`${path.basename(dest)}\`\nNak buat apa?`, {
         parseMode: "Markdown",
         replyMarkup: {
           inline_keyboard: [
             [
               { text: "🔍 Analisis", callback_data: "apk:analyze" },
-              { text: "🧩 Decompile", callback_data: "apk:decompile" },
+              { text: "🔐 Audit", callback_data: "apk:audit" },
             ],
             [
-              { text: "🔨 Build/Recompile", callback_data: "apk:build" },
+              { text: "🧩 Decompile", callback_data: "apk:decompile" },
               { text: "✏️ Modifikasi", callback_data: "apk:modify" },
             ],
+            [
+              { text: "🛠 Fix/Patch", callback_data: "apk:fix" },
+              { text: "🔨 Rebuild", callback_data: "apk:build" },
+            ],
+            [{ text: "📊 Diff (banding APK lain)", callback_data: "apk:diff" }],
           ],
         },
       });
@@ -651,9 +711,27 @@ export class SuzuBot {
       return;
     }
 
-    // Other files → announce path so the agent can read/analyse.
-    const note = `User memuat naik fail ke: ${dest}` + (caption ? `\nNota user: ${caption}` : "");
-    await this.routeToAgent(chatId, userId, note, { replyTo: msg.message_id });
+    // If the user gave a caption with the file, act on it directly.
+    if (caption && caption.trim()) {
+      const note = `User memuat naik fail ke: ${dest}\nNota user: ${caption.trim()}`;
+      await this.routeToAgent(chatId, userId, note, { replyTo: msg.message_id });
+      return;
+    }
+
+    // Other files → ask what to do (so it's not rigid) instead of guessing.
+    this.pendingFile.set(userId, dest);
+    await this.tg.sendMessage(chatId, `📄 Fail diterima: \`${path.basename(dest)}\`\nNak buat apa?`, {
+      parseMode: "Markdown",
+      replyMarkup: {
+        inline_keyboard: [
+          [
+            { text: "📄 Analisis isi", callback_data: "file:analyze" },
+            { text: "🔍 Cari isu/error", callback_data: "file:scan" },
+          ],
+          [{ text: "📝 Ringkaskan", callback_data: "file:summary" }],
+        ],
+      },
+    });
   }
 
   // Handle an uploaded image. Two complementary paths so the AI can ALWAYS
