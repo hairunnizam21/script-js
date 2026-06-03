@@ -1,0 +1,22 @@
+# Local config & secrets — NEVER commit
+.env
+*.env
+!.env.example
+
+# Runtime data (per-user chats, uploads, sessions, logs, keystores)
+data/
+*.log
+*.pid
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

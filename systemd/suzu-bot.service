@@ -1,0 +1,18 @@
+[Unit]
+Description=Suzu-JS Telegram AI bot (APK reverse-engineering)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and paths to your install.
+User=%i
+ExecStart=/usr/bin/env node %h/script-js/bin/suzu run
+Restart=on-failure
+RestartSec=5
+# Data dir (sessions, per-user files, logs). Override if needed.
+Environment=SUZU_DATA_DIR=%h/.suzu-js
+WorkingDirectory=%h/script-js
+
+[Install]
+WantedBy=default.target

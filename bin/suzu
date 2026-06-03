@@ -1,0 +1,270 @@
+#!/usr/bin/env node
+// Suzu-JS command-line entrypoint (Kali-flavoured).
+//
+//   suzu start     start the Telegram bot in the background
+//   suzu stop      stop the background bot
+//   suzu restart   stop + start
+//   suzu status    show whether the bot is running
+//   suzu run       run the bot in the foreground (Ctrl-C to quit)
+//   suzu logs [-f] show / follow the bot log
+//   suzu config    interactive configuration (.env)
+//   suzu models    list available AI models
+//   suzu help
+
+import fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+import {
+  loadConfig,
+  saveEnv,
+  ensureDirs,
+  PID_FILE,
+  LOG_FILE,
+  LOG_DIR,
+  ENV_FILE,
+} from "../src/config.js";
+import * as ui from "../src/ui.js";
+import { fetchModels } from "../src/models.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const VERSION = "1.0.0";
+const isTermux = (process.env.PREFIX || "").includes("com.termux");
+
+function readPid() {
+  try {
+    const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
+    return Number.isFinite(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function termux(cmd) {
+  if (!isTermux) return;
+  try {
+    spawnSync(cmd, { stdio: "ignore", shell: true });
+  } catch {
+    /* optional */
+  }
+}
+
+async function cmdStart() {
+  ensureDirs();
+  const existing = readPid();
+  if (isAlive(existing)) {
+    console.log(ui.warn(`Bot sudah berjalan (PID ${existing}).`));
+    return;
+  }
+  const cfg = loadConfig();
+  if (!cfg.telegramToken) {
+    console.log(ui.err("TELEGRAM_BOT_TOKEN belum diset. Jalankan: ") + ui.color.bold("suzu config"));
+    process.exit(1);
+  }
+  const out = fs.openSync(LOG_FILE, "a");
+  const child = spawn(process.execPath, [__filename, "run"], {
+    detached: true,
+    stdio: ["ignore", out, out],
+    env: process.env,
+  });
+  child.unref();
+  fs.writeFileSync(PID_FILE, String(child.pid));
+  termux("termux-wake-lock"); // keep CPU awake while Termux is open
+  console.log(ui.ok(`Bot dimulakan di latar belakang (PID ${child.pid}).`));
+  console.log(ui.info(`Log: ${LOG_FILE}`));
+  console.log(ui.info("Lihat log langsung: ") + ui.color.bold("suzu logs -f"));
+}
+
+function cmdStop() {
+  const pid = readPid();
+  if (!isAlive(pid)) {
+    console.log(ui.warn("Bot tidak berjalan."));
+    try {
+      fs.unlinkSync(PID_FILE);
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.unlinkSync(PID_FILE);
+  } catch {
+    /* ignore */
+  }
+  termux("termux-wake-unlock");
+  console.log(ui.ok(`Bot dihentikan (PID ${pid}).`));
+}
+
+function cmdStatus() {
+  const pid = readPid();
+  const cfg = loadConfig();
+  console.log(ui.banner(VERSION));
+  if (isAlive(pid)) {
+    console.log(ui.ok(`Status: BERJALAN (PID ${pid})`));
+  } else {
+    console.log(ui.err("Status: BERHENTI"));
+  }
+  console.log(ui.info(`API base URL : ${cfg.apiBaseUrl}`));
+  console.log(ui.info(`Model default: ${cfg.defaultModel}`));
+  console.log(ui.info(`API key set  : ${cfg.apiKey ? "ya" : "TIDAK"}`));
+  console.log(ui.info(`Bot token set: ${cfg.telegramToken ? "ya" : "TIDAK"}`));
+  console.log(ui.info(`Data dir     : ${cfg.dataDir}`));
+  console.log(ui.info(`Persekitaran : ${isTermux ? "Termux" : "Server/Linux"}`));
+}
+
+async function cmdRun() {
+  // Foreground run. Imported lazily so other commands don't pay the cost.
+  const { SuzuBot } = await import("../src/bot.js");
+  if (process.stdout.isTTY) process.stdout.write(ui.banner(VERSION) + "\n");
+  const bot = new SuzuBot();
+  const shutdown = () => {
+    console.log("\n" + ui.warn("Menghentikan bot…"));
+    bot.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  try {
+    await bot.start();
+  } catch (e) {
+    console.error(ui.err(e.message || String(e)));
+    process.exit(1);
+  }
+}
+
+function cmdLogs(follow) {
+  if (!fs.existsSync(LOG_FILE)) {
+    console.log(ui.warn("Belum ada log."));
+    return;
+  }
+  if (follow) {
+    const t = spawn("tail", ["-n", "100", "-f", LOG_FILE], { stdio: "inherit" });
+    process.on("SIGINT", () => {
+      t.kill();
+      process.exit(0);
+    });
+  } else {
+    const data = fs.readFileSync(LOG_FILE, "utf8").split("\n");
+    console.log(data.slice(-100).join("\n"));
+  }
+}
+
+function ask(rl, q, def) {
+  return new Promise((res) => {
+    const suffix = def ? ui.color.gray(` [${def}]`) : "";
+    rl.question(ui.color.cyan("? ") + q + suffix + " ", (a) => res(a.trim() || def || ""));
+  });
+}
+
+async function cmdConfig() {
+  ensureDirs();
+  console.log(ui.banner(VERSION));
+  console.log(ui.info("Konfigurasi Suzu-JS (disimpan ke " + ENV_FILE + ")\n"));
+  const cfg = loadConfig();
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const token = await ask(rl, "Telegram Bot Token (dari @BotFather)", cfg.telegramToken);
+  const baseUrl = await ask(rl, "AI Base URL", cfg.apiBaseUrl);
+  const apiKey = await ask(rl, "AI API Key", cfg.apiKey);
+  const model = await ask(rl, "Model default", cfg.defaultModel);
+  const allowed = await ask(
+    rl,
+    "Telegram user ID yang dibenarkan (pisah koma, kosong = semua)",
+    cfg.allowedUserIds.join(","),
+  );
+  rl.close();
+  saveEnv(
+    {
+      TELEGRAM_BOT_TOKEN: token,
+      AI_API_BASE_URL: baseUrl.replace(/\/+$/, ""),
+      AI_API_KEY: apiKey,
+      AI_DEFAULT_MODEL: model,
+      TELEGRAM_ALLOWED_USER_IDS: allowed,
+    },
+    ENV_FILE,
+  );
+  console.log("\n" + ui.ok("Konfigurasi disimpan."));
+  console.log(ui.info("Mula bot: ") + ui.color.bold("suzu start"));
+}
+
+async function cmdModels() {
+  const cfg = loadConfig();
+  console.log(ui.info(`Mengambil senarai model dari ${cfg.apiBaseUrl} …`));
+  const models = await fetchModels(cfg);
+  console.log(ui.line());
+  for (const m of models) {
+    console.log(`  ${ui.color.green(m.id)}${m.vision ? ui.color.yellow("  👁 vision") : ""}  ${ui.color.gray(m.label)}`);
+  }
+  console.log(ui.line());
+  console.log(ui.info(`${models.length} model. Default: ${cfg.defaultModel}`));
+}
+
+function cmdHelp() {
+  console.log(ui.banner(VERSION));
+  const rows = [
+    ["suzu start", "mula bot di latar belakang"],
+    ["suzu stop", "henti bot"],
+    ["suzu restart", "henti + mula semula"],
+    ["suzu status", "papar status bot"],
+    ["suzu run", "jalankan bot di foreground"],
+    ["suzu logs [-f]", "papar / ikut log"],
+    ["suzu config", "tetapkan token & API"],
+    ["suzu models", "senarai model AI"],
+    ["suzu help", "bantuan ini"],
+  ];
+  for (const [c, d] of rows) {
+    console.log("  " + ui.color.bold(c.padEnd(16)) + ui.color.gray(d));
+  }
+  console.log("");
+  console.log(ui.color.gray("  Data & .env: " + LOG_DIR.replace(/logs$/, "")));
+}
+
+async function main() {
+  const [, , cmd, ...rest] = process.argv;
+  switch ((cmd || "help").toLowerCase()) {
+    case "start":
+      return cmdStart();
+    case "stop":
+      return cmdStop();
+    case "restart":
+      cmdStop();
+      return cmdStart();
+    case "status":
+      return cmdStatus();
+    case "run":
+    case "foreground":
+      return cmdRun();
+    case "logs":
+      return cmdLogs(rest.includes("-f") || rest.includes("--follow"));
+    case "config":
+      return cmdConfig();
+    case "models":
+      return cmdModels();
+    case "help":
+    case "-h":
+    case "--help":
+    default:
+      return cmdHelp();
+  }
+}
+
+main().catch((e) => {
+  console.error(ui.err(e.stack || e.message || String(e)));
+  process.exit(1);
+});
