@@ -266,10 +266,18 @@ async function cmdModels() {
   const models = await fetchModels(cfg);
   console.log(ui.line());
   for (const m of models) {
-    console.log(`  ${ui.color.green(m.id)}${m.vision ? ui.color.yellow("  👁 vision") : ""}  ${ui.color.gray(m.label)}`);
+    const tags =
+      (m.vision ? ui.color.yellow("  👁 vision") : "") +
+      (m.custom ? ui.color.cyan("  ✎ custom") : "");
+    console.log(`  ${ui.color.green(m.id)}${tags}  ${ui.color.gray(m.label)}`);
   }
   console.log(ui.line());
-  console.log(ui.info(`${models.length} model. Default: ${cfg.defaultModel}`));
+  const customCount = models.filter((m) => m.custom).length;
+  console.log(
+    ui.info(
+      `${models.length} model${customCount ? ` (${customCount} custom)` : ""}. Default: ${cfg.defaultModel}`,
+    ),
+  );
 }
 
 function cmdHelp() {
