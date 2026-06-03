@@ -349,6 +349,38 @@ export class SuzuBot {
         await this.tg.sendMessage(chatId, "🆕 Sesi baharu dimulakan.");
         return true;
       }
+      case "/memory":
+      case "/ingat": {
+        // `/memory clear` wipes it; `/memory forget <text>` removes matches;
+        // otherwise list saved facts.
+        const sub = (arg || "").trim();
+        if (/^clear$/i.test(sub)) {
+          this.store.clearMemory(userId);
+          await this.tg.sendMessage(chatId, "🧠 Memori jangka panjang dikosongkan.");
+          return true;
+        }
+        const m = sub.match(/^forget\s+(.+)$/i);
+        if (m) {
+          const removed = this.store.removeMemory(userId, m[1].trim());
+          await this.tg.sendMessage(chatId, removed ? `🗑️ Dibuang ${removed} memori.` : "Tiada memori sepadan.");
+          return true;
+        }
+        const items = this.store.loadMemory(userId);
+        if (!items.length) {
+          await this.tg.sendMessage(
+            chatId,
+            "🧠 Tiada memori lagi. Beritahu saya keutamaan anda (cth \"selalu build arm64 sahaja\") dan saya akan ingat.",
+          );
+          return true;
+        }
+        const body = items.map((it, i) => `${i + 1}. ${it.text}`).join("\n");
+        await this.tg.sendMessage(
+          chatId,
+          `🧠 *Memori jangka panjang:*\n${body}\n\n_/memory forget <teks>_ untuk buang, _/memory clear_ untuk kosongkan.`,
+          { parseMode: "Markdown" },
+        );
+        return true;
+      }
       case "/status": {
         await this.tg.sendMessage(chatId, await this.statusText(userId), { parseMode: "Markdown" });
         return true;
@@ -811,6 +843,12 @@ export class SuzuBot {
       keystoreAlias: this.cfg.keystoreAlias,
       deliverables: [],
       deliverCaptions: {},
+      // Long-term memory accessors for the remember/forget/list_memory tools.
+      memory: {
+        add: (text) => this.store.addMemory(userId, text),
+        remove: (q) => this.store.removeMemory(userId, q),
+        list: () => this.store.loadMemory(userId),
+      },
       // Long-running tools (APK/project builds) report live % here so the chat
       // status card shows a progress bar instead of a bare spinner.
       onProgress: (p) => status.setProgress(p || {}),
@@ -833,7 +871,7 @@ export class SuzuBot {
         ctx,
         cfg: this.cfg,
         session,
-        systemPrompt: renderSystemPrompt(workspace),
+        systemPrompt: renderSystemPrompt(workspace, this.store.memoryText(userId)),
         userContent,
         onEvent: (kind, payload) => {
           if (kind === "tool_start") status.setPhase(`⚙️ ${phaseLabel(payload.name)}…`);
@@ -1007,6 +1045,7 @@ export class SuzuBot {
       "`/id` — papar ID Telegram anda",
       "`/reset` — kosongkan memori chat",
       "`/new` — mula sesi baharu",
+      "`/memory` — lihat memori jangka panjang (keutamaan tersimpan)",
       "`/help` — bantuan ini",
     ];
     if (userId && this.isAdmin(userId)) {
